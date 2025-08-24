@@ -1,0 +1,19 @@
+# Ignore node_modules
+node_modules/
+
+# Ignore environment files
+.env
+
+# Ignore logs
+*.log
+
+# Ignore system files
+.DS_Store
+
+.Config
+
+venvo/
+
+*.db
+*.json
+*.csv".env" 
