@@ -1,419 +1,373 @@
 # host_SQL.py
 import sqlite3
 import datetime
+from typing import Iterable, Dict, Any
 
 import Config
 
+# -----------------------------
+# Base DDL
+# -----------------------------
+
 create_boundaries_tracking_table = """
-    CREATE TABLE IF NOT EXISTS "boundaries_tracking" (
-        "id"    INTEGER NOT NULL UNIQUE,
-        "xmin"  REAL,
-        "ymin"  REAL,
-        "xmax"  REAL,
-        "ymax"  REAL,
-        "timestamp" INTEGER,
-        "total" INTEGER,
-        PRIMARY KEY("id")
-    );
+CREATE TABLE IF NOT EXISTS boundaries_tracking (
+  id INTEGER PRIMARY KEY,
+  xmin REAL, ymin REAL, xmax REAL, ymax REAL,
+  timestamp INTEGER, total INTEGER
+);
 """
 
 create_listing_tracking_table = """
-    CREATE TABLE IF NOT EXISTS "listing_tracking" (
-        "id"    TEXT NOT NULL,
-        "ListingObjType" TEXT,
-        "roomTypeCategory" TEXT,
-        "title" TEXT,
-        "name" TEXT,
-        "picture" TEXT,
-        "checkin" TEXT,
-        "checkout" TEXT,
-        "price" TEXT,
-        "discounted_price" TEXT,
-        "original_price" TEXT,
-        "link"  TEXT,
-        "scraping_time" INTEGER,
-        "needs_detail_scraping" INTEGER DEFAULT 0,
-        "has_detailed_data" INTEGER DEFAULT 0,
-        reviewsCount INTEGER,
-        averageRating REAL,
-        host TEXT,
-        airbnbLuxe TEXT,
-        location TEXT,
-        "maxGuestCapacity" INTEGER,
-        "isGuestFavorite" TEXT,
-        "lat" REAL,
-        "lng" REAL,
-        "isSuperhost" TEXT,
-        "isVerified" TEXT,
-        "ratingCount" TEXT,
-        userId TEXT,
-        years INTEGER,
-        months INTEGER,
-        hostrAtingAverage REAL,
-        PRIMARY KEY("id")
-    );
+CREATE TABLE IF NOT EXISTS listing_tracking (
+  id TEXT PRIMARY KEY,
+  ListingObjType TEXT,
+  roomTypeCategory TEXT,
+  title TEXT,
+  name TEXT,
+  picture TEXT,
+  checkin TEXT,
+  checkout TEXT,
+  price TEXT,
+  discounted_price TEXT,
+  original_price TEXT,
+  link TEXT,
+  scraping_time INTEGER,
+  needs_detail_scraping INTEGER DEFAULT 0,
+  has_detailed_data INTEGER DEFAULT 0,
+  reviewsCount INTEGER,
+  averageRating REAL,
+  host TEXT,
+  airbnbLuxe TEXT,
+  location TEXT,
+  maxGuestCapacity INTEGER,
+  isGuestFavorite TEXT,
+  lat REAL,
+  lng REAL,
+  isSuperhost TEXT,
+  isVerified TEXT,
+  ratingCount TEXT,
+  userId TEXT,
+  years INTEGER,
+  months INTEGER,
+  hostrAtingAverage REAL
+);
 """
 
-# NEW: host profile table
-create_host_tracking_table = """
-    CREATE TABLE IF NOT EXISTS host_tracking (
-        userId TEXT PRIMARY KEY,
-        name TEXT,
-        isSuperhost INTEGER,
-        isVerified INTEGER,
-        ratingAverage REAL,
-        ratingCount INTEGER,
-        years INTEGER,
-        months INTEGER,
-        total_listings INTEGER,
-        profile_url TEXT,
-        scraping_time INTEGER
-    );
-"""
-
-create_listing_index = """
-    CREATE INDEX IF NOT EXISTS idx_listing ON listing_tracking(id);
-"""
+create_listing_index = """CREATE INDEX IF NOT EXISTS idx_listing ON listing_tracking(id);"""
 
 create_tracking_table = """
-    CREATE TABLE IF NOT EXISTS tracking (
-        tracking INTEGER
-    );
+CREATE TABLE IF NOT EXISTS tracking (
+  tracking INTEGER
+);
 """
+
+# ---- Host core table (expanded)
+create_host_tracking_table = """
+CREATE TABLE IF NOT EXISTS host_tracking (
+  userId TEXT PRIMARY KEY,
+  name TEXT,
+  isSuperhost INTEGER,
+  isVerified INTEGER,
+  ratingAverage REAL,
+  ratingCount INTEGER,
+  years INTEGER,
+  months INTEGER,
+  total_listings INTEGER,
+  profile_url TEXT,
+  scraping_time INTEGER,
+  -- NEW
+  profile_photo_url TEXT,
+  about_text TEXT,
+  bio_text TEXT
+);
+"""
+
+# ---- Child tables for variable-length data
+
+create_host_listings_table = """
+CREATE TABLE IF NOT EXISTS host_listings (
+  userId TEXT,
+  listingId TEXT,
+  listingUrl TEXT,
+  PRIMARY KEY (userId, listingId)
+);
+"""
+
+create_host_guidebooks_table = """
+CREATE TABLE IF NOT EXISTS host_guidebooks (
+  userId TEXT,
+  title TEXT,
+  url TEXT,
+  PRIMARY KEY (userId, url)
+);
+"""
+
+create_host_travels_table = """
+CREATE TABLE IF NOT EXISTS host_travels (
+  userId TEXT,
+  place TEXT,
+  country TEXT,
+  trips INTEGER,
+  when_label TEXT,
+  PRIMARY KEY (userId, place, when_label)
+);
+"""
+
+create_host_reviews_table = """
+CREATE TABLE IF NOT EXISTS host_reviews (
+  userId TEXT,
+  reviewId TEXT,
+  sourceListingId TEXT,
+  reviewer_name TEXT,
+  reviewer_location TEXT,
+  rating REAL,
+  date_text TEXT,
+  text TEXT,
+  PRIMARY KEY (userId, reviewId)
+);
+"""
+
+# -----------------------------
+# Utilities
+# -----------------------------
 
 def execute_sql_query_no_results(db: sqlite3.Connection, query: str):
     cur = db.cursor()
     cur.execute(query)
     db.commit()
 
+def _add_column_if_missing(db: sqlite3.Connection, table: str, column: str, ddl_type: str):
+    cur = db.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    if column not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+        db.commit()
+
 def init_all_tables(db: sqlite3.Connection):
-    """Ensure every table/index used by this project exists."""
+    # base
+    execute_sql_query_no_results(db, create_boundaries_tracking_table)
     execute_sql_query_no_results(db, create_listing_tracking_table)
     execute_sql_query_no_results(db, create_listing_index)
     execute_sql_query_no_results(db, create_tracking_table)
-    execute_sql_query_no_results(db, create_boundaries_tracking_table)
+
+    # host
     execute_sql_query_no_results(db, create_host_tracking_table)
+    execute_sql_query_no_results(db, create_host_listings_table)
+    execute_sql_query_no_results(db, create_host_guidebooks_table)
+    execute_sql_query_no_results(db, create_host_travels_table)
+    execute_sql_query_no_results(db, create_host_reviews_table)
+
+    # migrations (idempotent)
+    _add_column_if_missing(db, "host_tracking", "profile_photo_url", "TEXT")
+    _add_column_if_missing(db, "host_tracking", "about_text", "TEXT")
+    _add_column_if_missing(db, "host_tracking", "bio_text", "TEXT")
+
+# -----------------------------
+# Listing helpers
+# -----------------------------
 
 def insert_new_listing(db: sqlite3.Connection, data: dict):
-    """Insert listing with full detailed data (requires PDP API call)"""
-    now = datetime.datetime.now()
-    now_timestamp = int(now.timestamp())
-    data['scraping_time'] = now_timestamp
+    now_ts = int(datetime.datetime.now().timestamp())
+    data['scraping_time'] = now_ts
     data['has_detailed_data'] = 1
     data['needs_detail_scraping'] = 0
-    
+
     query = """
-        INSERT OR REPLACE INTO listing_tracking (
-            "id", "ListingObjType", "roomTypeCategory", 
-            "title", "name", "picture", "checkin", "checkout", "price", "discounted_price", "original_price", "link", "scraping_time",
-            "needs_detail_scraping", "has_detailed_data",
-            reviewsCount, averageRating, host, "airbnbLuxe", "location", "maxGuestCapacity", "isGuestFavorite",
-            "lat", "lng", "isSuperhost", "isVerified", "ratingCount", "userId", "years", "months", "hostrAtingAverage"
-        ) VALUES (
-            :id, :ListingObjType, :roomTypeCategory, :title, :name, :picture, :checkin, 
-            :checkout, :price, :discounted_price, :original_price, :link, :scraping_time,
-            :needs_detail_scraping, :has_detailed_data,
-            :reviewsCount, :averageRating, :host, :airbnbLuxe, :location, :maxGuestCapacity, :isGuestFavorite,
-            :lat, :lng, :isSuperhost, :isVerified, :ratingCount, :userId, :years, :months, :hostrAtingAverage
-        )
+      INSERT OR REPLACE INTO listing_tracking (
+        id, ListingObjType, roomTypeCategory, title, name, picture, checkin, checkout,
+        price, discounted_price, original_price, link, scraping_time,
+        needs_detail_scraping, has_detailed_data,
+        reviewsCount, averageRating, host, airbnbLuxe, location, maxGuestCapacity, isGuestFavorite,
+        lat, lng, isSuperhost, isVerified, ratingCount, userId, years, months, hostrAtingAverage
+      ) VALUES (
+        :id, :ListingObjType, :roomTypeCategory, :title, :name, :picture, :checkin, :checkout,
+        :price, :discounted_price, :original_price, :link, :scraping_time,
+        :needs_detail_scraping, :has_detailed_data,
+        :reviewsCount, :averageRating, :host, :airbnbLuxe, :location, :maxGuestCapacity, :isGuestFavorite,
+        :lat, :lng, :isSuperhost, :isVerified, :ratingCount, :userId, :years, :months, :hostrAtingAverage
+      )
     """
-    cur = db.cursor()
-    cur.execute(query, data)
+    db.cursor().execute(query, data)
     db.commit()
 
 def insert_basic_listing(db: sqlite3.Connection, data: dict):
-    """Insert listing with just search result data, no detailed PDP API call needed"""
-    now = datetime.datetime.now()
-    now_timestamp = int(now.timestamp())
-    data['scraping_time'] = now_timestamp
+    now_ts = int(datetime.datetime.now().timestamp())
+    data['scraping_time'] = now_ts
     data['has_detailed_data'] = 0
     data['needs_detail_scraping'] = 1
-    
-    # defaults for PDP-dependent fields
+
     defaults = {
-        'reviewsCount': 0,
-        'averageRating': 0.0,
-        'host': None,
-        'airbnbLuxe': False,
-        'location': None,
-        'maxGuestCapacity': 0,
-        'isGuestFavorite': False,
-        'lat': None,
-        'lng': None,
-        'isSuperhost': False,
-        'isVerified': False,
-        'ratingCount': 0,
-        'userId': None,
-        'years': 0,
-        'months': 0,
-        'hostrAtingAverage': 0.0
+        'reviewsCount': 0, 'averageRating': 0.0, 'host': None, 'airbnbLuxe': False,
+        'location': None, 'maxGuestCapacity': 0, 'isGuestFavorite': False, 'lat': None, 'lng': None,
+        'isSuperhost': False, 'isVerified': False, 'ratingCount': 0, 'userId': None,
+        'years': 0, 'months': 0, 'hostrAtingAverage': 0.0
     }
     for k, v in defaults.items():
         data.setdefault(k, v)
 
     query = """
-        INSERT OR REPLACE INTO listing_tracking (
-            "id", "ListingObjType", "roomTypeCategory",
-            "title", "name", "picture", "checkin", "checkout",
-            "price", "discounted_price", "original_price", "link",
-            "scraping_time", "needs_detail_scraping", "has_detailed_data",
-            reviewsCount, averageRating, host, "airbnbLuxe", "location",
-            "maxGuestCapacity", "isGuestFavorite", "lat", "lng",
-            "isSuperhost", "isVerified", "ratingCount", "userId",
-            "years", "months", "hostrAtingAverage"
-        ) VALUES (
-            :id, :ListingObjType, :roomTypeCategory,
-            :title, :name, :picture, :checkin, :checkout,
-            :price, :discounted_price, :original_price, :link,
-            :scraping_time, :needs_detail_scraping, :has_detailed_data,
-            :reviewsCount, :averageRating, :host, :airbnbLuxe, :location,
-            :maxGuestCapacity, :isGuestFavorite, :lat, :lng,
-            :isSuperhost, :isVerified, :ratingCount, :userId,
-            :years, :months, :hostrAtingAverage
-        )
+      INSERT OR REPLACE INTO listing_tracking (
+        id, ListingObjType, roomTypeCategory, title, name, picture, checkin, checkout,
+        price, discounted_price, original_price, link, scraping_time,
+        needs_detail_scraping, has_detailed_data,
+        reviewsCount, averageRating, host, airbnbLuxe, location, maxGuestCapacity, isGuestFavorite,
+        lat, lng, isSuperhost, isVerified, ratingCount, userId, years, months, hostrAtingAverage
+      ) VALUES (
+        :id, :ListingObjType, :roomTypeCategory, :title, :name, :picture, :checkin, :checkout,
+        :price, :discounted_price, :original_price, :link, :scraping_time,
+        :needs_detail_scraping, :has_detailed_data,
+        :reviewsCount, :averageRating, :host, :airbnbLuxe, :location, :maxGuestCapacity, :isGuestFavorite,
+        :lat, :lng, :isSuperhost, :isVerified, :ratingCount, :userId, :years, :months, :hostrAtingAverage
+      )
     """
-    cur = db.cursor()
-    cur.execute(query, data)
+    db.cursor().execute(query, data)
     db.commit()
-
-
-
 
 def update_listing_with_details(db: sqlite3.Connection, listing_id: str, detail_data: dict):
-    """Update existing basic listing with detailed data from PDP API"""
     detail_data['has_detailed_data'] = 1
     detail_data['needs_detail_scraping'] = 0
-    
-    query = """
-        UPDATE listing_tracking SET
-            reviewsCount = :reviewsCount,
-            averageRating = :averageRating,
-            host = :host,
-            airbnbLuxe = :airbnbLuxe,
-            location = :location,
-            maxGuestCapacity = :maxGuestCapacity,
-            isGuestFavorite = :isGuestFavorite,
-            lat = :lat,
-            lng = :lng,
-            isSuperhost = :isSuperhost,
-            isVerified = :isVerified,
-            ratingCount = :ratingCount,
-            userId = :userId,
-            years = :years,
-            months = :months,
-            hostrAtingAverage = :hostrAtingAverage,
-            has_detailed_data = :has_detailed_data,
-            needs_detail_scraping = :needs_detail_scraping
-        WHERE id = :id
-    """
     detail_data['id'] = listing_id
-    cur = db.cursor()
-    cur.execute(query, detail_data)
+
+    query = """
+      UPDATE listing_tracking SET
+        reviewsCount=:reviewsCount, averageRating=:averageRating, host=:host, airbnbLuxe=:airbnbLuxe,
+        location=:location, maxGuestCapacity=:maxGuestCapacity, isGuestFavorite=:isGuestFavorite,
+        lat=:lat, lng=:lng, isSuperhost=:isSuperhost, isVerified=:isVerified, ratingCount=:ratingCount,
+        userId=:userId, years=:years, months=:months, hostrAtingAverage=:hostrAtingAverage,
+        has_detailed_data=:has_detailed_data, needs_detail_scraping=:needs_detail_scraping
+      WHERE id=:id
+    """
+    db.cursor().execute(query, detail_data)
     db.commit()
 
-def mark_listing_for_detailed_scraping(db: sqlite3.Connection, listing_id: str):
-    query = """
-        UPDATE listing_tracking 
-        SET needs_detail_scraping = 1 
-        WHERE id = ?
-    """
+def check_if_listing_exists(db: sqlite3.Connection, listing_id: str) -> bool:
+    now = datetime.datetime.now()
+    start_time = int((now - datetime.timedelta(days=Config.UPDATE_WINDOW_DAYS_LISTING)).timestamp())
     cur = db.cursor()
-    cur.execute(query, (listing_id,))
-    db.commit()
+    cur.execute(
+        "SELECT 1 FROM listing_tracking WHERE id=? AND scraping_time>=? LIMIT 1",
+        (listing_id, start_time),
+    )
+    return cur.fetchone() is not None
 
-def get_listings_needing_details(db: sqlite3.Connection, limit: int = 100):
-    query = """
-        SELECT id, link, title FROM listing_tracking 
-        WHERE needs_detail_scraping = 1 AND has_detailed_data = 0
-        ORDER BY scraping_time DESC
-        LIMIT ?
-    """
-    cur = db.cursor()
-    cur.execute(query, (limit,))
-    return cur.fetchall()
+# -----------------------------
+# Host profile + child writers
+# -----------------------------
 
-def get_basic_listings_count(db: sqlite3.Connection):
+def upsert_host_profile(db: sqlite3.Connection, data: dict):
+    """
+    Keys you can pass:
+      userId, name, isSuperhost, isVerified, ratingAverage, ratingCount,
+      years, months, total_listings, profile_url, scraping_time,
+      profile_photo_url, about_text, bio_text
+    """
+    init_all_tables(db)
+
     cur = db.cursor()
+    cur.execute("SELECT * FROM host_tracking WHERE userId=?", (data.get("userId"),))
+    row = cur.fetchone()
+
+    def keep(old, new):
+        return new if new not in (None, "") else old
+
+    to_save = {
+        "userId": data.get("userId"),
+        "name": keep(row[1] if row else None, data.get("name")),
+        "isSuperhost": keep(row[2] if row else None, data.get("isSuperhost")),
+        "isVerified": keep(row[3] if row else None, data.get("isVerified")),
+        "ratingAverage": keep(row[4] if row else None, data.get("ratingAverage")),
+        "ratingCount": keep(row[5] if row else None, data.get("ratingCount")),
+        "years": keep(row[6] if row else None, data.get("years")),
+        "months": keep(row[7] if row else None, data.get("months")),
+        "total_listings": data.get("total_listings") if data.get("total_listings") is not None else (row[8] if row else 0),
+        "profile_url": keep(row[9] if row else None, data.get("profile_url")),
+        "scraping_time": data.get("scraping_time") or int(datetime.datetime.now().timestamp()),
+        "profile_photo_url": keep(row[11] if row else None, data.get("profile_photo_url")),
+        "about_text": keep(row[12] if row else None, data.get("about_text")),
+        "bio_text": keep(row[13] if row else None, data.get("bio_text")),
+    }
+
     cur.execute("""
-        SELECT COUNT(*) FROM listing_tracking 
-        WHERE has_detailed_data = 0
-    """)
-    return cur.fetchone()[0]
-
-def get_detailed_listings_count(db: sqlite3.Connection):
-    cur = db.cursor()
-    cur.execute("""
-        SELECT COUNT(*) FROM listing_tracking 
-        WHERE has_detailed_data = 1
-    """)
-    return cur.fetchone()[0]
-
-def insert_new_boundaries_tracking(db: sqlite3.Connection, data: dict):
-    now = datetime.datetime.now()
-    now_timestamp = int(now.timestamp())
-    data['timestamp'] = now_timestamp
-    cur = db.cursor()
-    cur.execute("""
-        SELECT * FROM boundaries_tracking where id = ?;
-    """, (data['id'],))
-    result = cur.fetchone()
-    if result is None:
-        query = """
-            INSERT INTO boundaries_tracking (
-                id, xmin, xmax, ymin, ymax, timestamp, total
-            ) VALUES (
-                :id, :xmin, :xmax, :ymin, :ymax, :timestamp, :total
-            );
-        """
-    else:
-        query = """
-            UPDATE boundaries_tracking
-            SET total = :total, timestamp = :timestamp
-            WHERE id = :id;
-        """
-    cur.execute(query, data)
-    db.commit()
-
-def check_if_listing_exists(db: sqlite3.Connection, listing_id: str):
-    now = datetime.datetime.now()
-    delta = datetime.timedelta(days=Config.UPDATE_WINDOW_DAYS_LISTING)
-    start_time = int((now - delta).timestamp())
-    query = """
-        SELECT * 
-          FROM listing_tracking 
-         WHERE id = ? AND scraping_time >= ?;
-    """
-    cur = db.cursor()
-    cur.execute(query, (listing_id, start_time,))
-    rows = cur.fetchall()
-    return len(rows) > 0
-
-def check_if_detailed_listing_exists(db: sqlite3.Connection, listing_id: str):
-    now = datetime.datetime.now()
-    delta = datetime.timedelta(days=Config.UPDATE_WINDOW_DAYS_LISTING)
-    start_time = int((now - delta).timestamp())
-    query = """
-        SELECT * 
-          FROM listing_tracking 
-         WHERE id = ? AND scraping_time >= ? AND has_detailed_data = 1;
-    """
-    cur = db.cursor()
-    cur.execute(query, (listing_id, start_time,))
-    rows = cur.fetchall()
-    return len(rows) > 0
-
-def check_if_boundaries_exists(db: sqlite3.Connection, _id: int):
-    now = datetime.datetime.now()
-    delta = datetime.timedelta(days=Config.UPDATE_WINDOW_DAYS_BOUNDARY)
-    start_time = int((now - delta).timestamp())
-    query = """
-        SELECT *
-          FROM boundaries_tracking
-          WHERE id = ? AND timestamp >= ?;
-    """
-    cur = db.cursor()
-    cur.execute(query, (_id, start_time,))
-    rows = cur.fetchall()
-    return len(rows) > 0
-
-def export_all_listings(db: sqlite3.Connection):
-    min_time = datetime.datetime.now() - datetime.timedelta(days=1)
-    min_ts = int(min_time.timestamp())
-    query = """
-      WITH latest AS (
-        SELECT *,
-               ROW_NUMBER() OVER (PARTITION BY id ORDER BY scraping_time DESC) AS rn
-        FROM listing_tracking
-        WHERE scraping_time >= ?
+      INSERT INTO host_tracking (
+        userId, name, isSuperhost, isVerified, ratingAverage, ratingCount,
+        years, months, total_listings, profile_url, scraping_time,
+        profile_photo_url, about_text, bio_text
+      ) VALUES (
+        :userId, :name, :isSuperhost, :isVerified, :ratingAverage, :ratingCount,
+        :years, :months, :total_listings, :profile_url, :scraping_time,
+        :profile_photo_url, :about_text, :bio_text
       )
-      SELECT
-        id,
-        ListingObjType          AS type,
-        roomTypeCategory        AS type_location,
-        title                   AS titre,
-        name                    AS nom,
-        picture                 AS image,
-        checkin,
-        checkout,
-        price                   AS prix,
-        discounted_price        AS prix_promo,
-        original_price          AS prix_original,
-        link                    AS lien,
-        scraping_time           AS scrape_time,
-        reviewsCount            AS nbr_avis,
-        averageRating           AS avg_evaluation,
-        host                    AS hote,
-        airbnbLuxe,
-        location,
-        maxGuestCapacity        AS max_personnes,
-        isGuestFavorite,
-        lat                     AS latitude,
-        lng                     AS longitude,
-        isSuperhost,
-        isVerified,
-        ratingCount             AS nbr_evaluation,
-        userId                  AS id_utilisateur,
-        CASE 
-            WHEN userId IS NOT NULL AND userId != '' 
-            THEN 'https://www.airbnb.com/users/show/' || userId
-            ELSE NULL 
-        END                     AS url_hote,
-        years                   AS annees,
-        months                  AS mois,
-        hostrAtingAverage       AS avg_hote_evaluation
-      FROM latest
-      WHERE rn = 1
-      ORDER BY scrape_time DESC;
-    """
-    cur = db.cursor()
-    cur.execute(query, (min_ts,))
-    return cur.fetchall()
-
-def export_listings_by_type(db: sqlite3.Connection, detailed_only: bool = False):
-    min_time = datetime.datetime.now() - datetime.timedelta(days=1)
-    min_time_timestamp = int(min_time.timestamp())
-    detail_filter = "AND has_detailed_data = 1" if detailed_only else ""
-    
-    query = f"""
-        SELECT *,
-               CASE 
-                   WHEN userId IS NOT NULL AND userId != '' 
-                   THEN 'https://www.airbnb.com/users/show/' || userId
-                   ELSE NULL 
-               END AS url_hote
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY id ORDER BY scraping_time DESC) AS rn
-            FROM listing_tracking
-            WHERE scraping_time >= ? {detail_filter}
-        )
-        WHERE rn = 1;
-    """
-    cur = db.cursor()
-    cur.execute(query, (min_time_timestamp,))
-    return cur.fetchall()
-
-def get_tracking(db: sqlite3.Connection):
-    cur = db.cursor()
-    cur.execute("""
-        SELECT * FROM tracking limit 1;
-    """)
-    result = cur.fetchone()
-    if result is None:
-        cur.execute("""
-        INSERT INTO tracking (tracking) VALUES (0);
-        """)
-        db.commit()
-        return 0
-    else:
-        return result[0]
-
-def update_tracking(db: sqlite3.Connection, tracking: int):
-    cur = db.cursor()
-    cur.execute("""
-    UPDATE tracking SET tracking = ?;
-    """, (tracking,))
+      ON CONFLICT(userId) DO UPDATE SET
+        name=excluded.name,
+        isSuperhost=excluded.isSuperhost,
+        isVerified=excluded.isVerified,
+        ratingAverage=excluded.ratingAverage,
+        ratingCount=excluded.ratingCount,
+        years=excluded.years,
+        months=excluded.months,
+        total_listings=excluded.total_listings,
+        profile_url=excluded.profile_url,
+        scraping_time=excluded.scraping_time,
+        profile_photo_url=excluded.profile_photo_url,
+        about_text=excluded.about_text,
+        bio_text=excluded.bio_text
+    """, to_save)
     db.commit()
+
+def replace_host_listings(db: sqlite3.Connection, user_id: str, items: Iterable[Dict[str, Any]]):
+    init_all_tables(db)
+    cur = db.cursor()
+    cur.execute("DELETE FROM host_listings WHERE userId=?", (user_id,))
+    cur.executemany(
+        "INSERT OR REPLACE INTO host_listings (userId, listingId, listingUrl) VALUES (?, ?, ?)",
+        [(user_id, str(i.get("listingId")), i.get("listingUrl")) for i in items if i.get("listingId")],
+    )
+    db.commit()
+
+def replace_host_guidebooks(db: sqlite3.Connection, user_id: str, items: Iterable[Dict[str, Any]]):
+    init_all_tables(db)
+    cur = db.cursor()
+    cur.execute("DELETE FROM host_guidebooks WHERE userId=?", (user_id,))
+    cur.executemany(
+        "INSERT OR REPLACE INTO host_guidebooks (userId, title, url) VALUES (?, ?, ?)",
+        [(user_id, i.get("title"), i.get("url")) for i in items if i.get("url")],
+    )
+    db.commit()
+
+def replace_host_travels(db: sqlite3.Connection, user_id: str, items: Iterable[Dict[str, Any]]):
+    init_all_tables(db)
+    cur = db.cursor()
+    cur.execute("DELETE FROM host_travels WHERE userId=?", (user_id,))
+    cur.executemany(
+        "INSERT OR REPLACE INTO host_travels (userId, place, country, trips, when_label) VALUES (?, ?, ?, ?, ?)",
+        [(user_id, i.get("place"), i.get("country"), int(i.get("trips") or 0), i.get("when")) for i in items],
+    )
+    db.commit()
+
+def upsert_host_reviews(db: sqlite3.Connection, user_id: str, items: Iterable[Dict[str, Any]]):
+    init_all_tables(db)
+    cur = db.cursor()
+    cur.executemany(
+        """INSERT OR REPLACE INTO host_reviews
+           (userId, reviewId, sourceListingId, reviewer_name, reviewer_location, rating, date_text, text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(
+            user_id,
+            i.get("reviewId"),
+            i.get("sourceListingId"),
+            i.get("reviewer_name"),
+            i.get("reviewer_location"),
+            float(i.get("rating")) if i.get("rating") is not None else None,
+            i.get("date_text"),
+            i.get("text"),
+        ) for i in items if i.get("reviewId")]
+    )
+    db.commit()
+
+# -----------------------------
+# Stats
+# -----------------------------
 
 def get_scraping_stats(db: sqlite3.Connection):
     cur = db.cursor()
@@ -432,46 +386,3 @@ def get_scraping_stats(db: sqlite3.Connection):
     cur.execute("SELECT COUNT(*) FROM listing_tracking WHERE scraping_time >= ?", (recent_time,))
     stats['recent_listings'] = cur.fetchone()[0]
     return stats
-
-# NEW: upsert host profile
-def upsert_host_profile(db: sqlite3.Connection, data: dict):
-    execute_sql_query_no_results(db, create_host_tracking_table)
-    cur = db.cursor()
-    cur.execute("SELECT * FROM host_tracking WHERE userId = ?", (data.get("userId"),))
-    row = cur.fetchone()
-
-    def keep(old, new):
-        return new if new is not None else old
-
-    to_save = {
-        "userId": data.get("userId"),
-        "name": keep(row[1] if row else None, data.get("name")),
-        "isSuperhost": keep(row[2] if row else None, data.get("isSuperhost")),
-        "isVerified": keep(row[3] if row else None, data.get("isVerified")),
-        "ratingAverage": keep(row[4] if row else None, data.get("ratingAverage")),
-        "ratingCount": keep(row[5] if row else None, data.get("ratingCount")),
-        "years": keep(row[6] if row else None, data.get("years")),
-        "months": keep(row[7] if row else None, data.get("months")),
-        "total_listings": keep(row[8] if row else 0, data.get("total_listings")),
-        "profile_url": keep(row[9] if row else None, data.get("profile_url")),
-        "scraping_time": data.get("scraping_time") or int(datetime.datetime.now().timestamp())
-    }
-
-    cur.execute("""
-        INSERT INTO host_tracking (userId, name, isSuperhost, isVerified, ratingAverage, ratingCount,
-                                   years, months, total_listings, profile_url, scraping_time)
-        VALUES (:userId, :name, :isSuperhost, :isVerified, :ratingAverage, :ratingCount,
-                :years, :months, :total_listings, :profile_url, :scraping_time)
-        ON CONFLICT(userId) DO UPDATE SET
-            name=excluded.name,
-            isSuperhost=excluded.isSuperhost,
-            isVerified=excluded.isVerified,
-            ratingAverage=excluded.ratingAverage,
-            ratingCount=excluded.ratingCount,
-            years=excluded.years,
-            months=excluded.months,
-            total_listings=excluded.total_listings,
-            profile_url=excluded.profile_url,
-            scraping_time=excluded.scraping_time;
-    """, to_save)
-    db.commit()
