@@ -113,6 +113,26 @@ def scrape_single_result(context: BrowserContext, item_search_token: str, listin
             if sid == "AVAILABILITY_CALENDAR_DEFAULT": out["location"], out["maxGuestCapacity"] = payload.get("localizedLocation"), payload.get("maxGuestCapacity", 0)
             elif sid == "REVIEWS_DEFAULT": out["isGuestFavorite"], out["reviewsCount"], out["averageRating"] = bool(payload.get("isGuestFavorite")), payload.get("overallCount", 0), payload.get("overallRating", 0.0)
             elif sid == "LOCATION_DEFAULT": out["lat"], out["lng"] = payload.get("lat"), payload.get("lng")
+            elif sid == "TITLE_DEFAULT":
+                out["title"] = payload.get("title")
+                out["roomTypeCategory"] = payload.get("roomTypeCategory")
+                try:
+                    # The primary picture is often found in this section
+                    pic_url = payload.get("shareSave", {}).get("embedData", {}).get("pictureUrl")
+                    if pic_url:
+                        out["picture"] = pic_url
+                except (KeyError, TypeError):
+                    pass
+
+            elif sid == "BOOK_IT_SIDEBAR":
+                try:
+                    # Prices are nested inside the "structuredDisplayPrice" object
+                    price_data = payload.get("structuredDisplayPrice", {}).get("primaryLine", {})
+                    out["price"] = price_data.get("price")
+                    out["discounted_price"] = price_data.get("discountedPrice")
+                    out["original_price"] = price_data.get("originalPrice")
+                except (KeyError, TypeError):
+                    pass
             elif sid == "MEET_YOUR_HOST":
                 card = payload.get("cardData", {})
                 out["host"], out["isSuperhost"], out["isVerified"], out["ratingCount"] = card.get("name"), card.get("isSuperhost", False), card.get("isVerified", False), card.get("ratingCount", 0)

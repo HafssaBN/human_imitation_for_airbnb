@@ -5,6 +5,7 @@ import json
 import urllib.parse
 import logging
 import random
+from datetime import datetime, timedelta
 from typing import List, Optional, Set, Dict, Union, Any
 
 from playwright.sync_api import (
@@ -287,7 +288,9 @@ def scrape_host(host_url: str):
     request_item_client_id: Optional[str] = None
     x_airbnb_api_key = "d306zoyjsyarp7ifhu67rjxn52tv0t20"
     request_client_version: Optional[str] = None
-
+    checkin_date = (datetime.now() + timedelta(days=90)).strftime('%Y-%m-%d')
+    checkout_date = (datetime.now() + timedelta(days=95)).strftime('%Y-%m-%d')
+    logger.info(f"[host] Using default search dates: {checkin_date} to {checkout_date}")
     with sync_playwright() as p:
         browser: Browser = p.chromium.launch(headless=False, proxy=HostConfig.CONFIG_PROXY, args=["--disable-features=Translate,TranslateUI,LanguageSettings", "--lang=en-US", "--disable-infobars", "--disable-extensions", "--no-first-run", "--disable-default-apps"])
         context: BrowserContext = browser.new_context(viewport={"width": 1400, "height": 900}, locale="en-US", extra_http_headers={"Accept-Language": "en-US,en;q=0.9"})
@@ -368,7 +371,11 @@ def scrape_host(host_url: str):
                 except Exception as e: logger.warning(f"[host] Could not insert basic listing {_id}: {e}")
             if request_item_token and detailed < HOST_DETAIL_SCRAPE_LIMIT:
                 try:
-                    info = {"id": _id, "link": item["listingUrl"]}
+                    info = {"id": _id,
+                             "link": item["listingUrl"],
+                             "checkin": checkin_date,
+                             "checkout": checkout_date
+                            }
                     dd = HostScrapingUtils.scrape_single_result(context=context, item_search_token=request_item_token, listing_info=info, logger=logger, api_key=x_airbnb_api_key, client_version=request_client_version or "", client_request_id=request_item_client_id or "", federated_search_id="", currency="MAD", locale="en", base_headers=request_headers)
                     if not dd.get("skip", False):
                         SQL.update_listing_with_details(db, _id, dd)
