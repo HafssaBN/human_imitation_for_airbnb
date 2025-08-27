@@ -17,3 +17,7 @@ venvo/
 *.db
 *.json
 *.csv".env" 
+__pycache__/
+airbnb host/__pycache__/
+airbnb host/Airbnb.db
+airbnb host/hosts.csv

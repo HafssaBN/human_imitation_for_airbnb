@@ -294,20 +294,58 @@ def check_if_boundaries_exists(db: sqlite3.Connection, _id: int):
 
 def export_all_listings(db: sqlite3.Connection):
     min_time = datetime.datetime.now() - datetime.timedelta(days=1)
-    min_time_timestamp = int(min_time.timestamp())
+    min_ts = int(min_time.timestamp())
     query = """
-        SELECT *
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY id ORDER BY scraping_time DESC) AS rn
-            FROM listing_tracking
-            WHERE scraping_time >= ?
-        )
-        WHERE rn = 1;
+      WITH latest AS (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY id ORDER BY scraping_time DESC) AS rn
+        FROM listing_tracking
+        WHERE scraping_time >= ?
+      )
+      SELECT
+        id,
+        ListingObjType          AS type,
+        roomTypeCategory        AS type_location,
+        title                   AS titre,
+        name                    AS nom,
+        picture                 AS image,
+        checkin,
+        checkout,
+        price                   AS prix,
+        discounted_price        AS prix_promo,
+        original_price          AS prix_original,
+        link                    AS lien,
+        scraping_time           AS scrape_time,
+        reviewsCount            AS nbr_avis,
+        averageRating           AS avg_evaluation,
+        host                    AS hote,
+        airbnbLuxe,
+        location,
+        maxGuestCapacity        AS max_personnes,
+        isGuestFavorite,
+        lat                     AS latitude,
+        lng                     AS longitude,
+        isSuperhost,
+        isVerified,
+        ratingCount             AS nbr_evaluation,
+        userId                  AS id_utilisateur,
+        years                   AS annees,
+        months                  AS mois,
+        hostrAtingAverage       AS avg_hote_evaluation,
+        CASE 
+            WHEN userId IS NOT NULL AND userId != '' 
+            THEN 'https://www.airbnb.com/users/show/' || userId
+            ELSE NULL 
+        END                     AS host_url
+      FROM latest
+      WHERE rn = 1
+      ORDER BY scrape_time DESC;
     """
     cur = db.cursor()
-    cur.execute(query, (min_time_timestamp,))
+    cur.execute(query, (min_ts,))
     return cur.fetchall()
+
+
 
 def export_listings_by_type(db: sqlite3.Connection, detailed_only: bool = False):
     """Export listings with option to filter by detail level"""
@@ -317,7 +355,12 @@ def export_listings_by_type(db: sqlite3.Connection, detailed_only: bool = False)
     detail_filter = "AND has_detailed_data = 1" if detailed_only else ""
     
     query = f"""
-        SELECT *
+        SELECT *,
+               CASE 
+                   WHEN userId IS NOT NULL AND userId != '' 
+                   THEN 'https://www.airbnb.com/users/show/' || userId
+                   ELSE NULL 
+               END AS url_hote
         FROM (
             SELECT *,
                    ROW_NUMBER() OVER (PARTITION BY id ORDER BY scraping_time DESC) AS rn

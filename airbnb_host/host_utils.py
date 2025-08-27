@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from playwright.sync_api import BrowserContext, Request, Response, Page
 
-import Config
+from .config import HostConfig 
 
 
 def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, Any]:
@@ -20,9 +20,9 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
         "name": None,
         "isSuperhost": False,
         "isVerified": False,
-        "profilePhoto": None,
-        "about": None,
-        "bio": None,  # Separate field for bio vs about
+        "profile_photo_url": None,
+        "about_text": None,
+        "bio_text": None,
         "memberSince": None,
         "ratingAverage": None,
         "ratingCount": 0,
@@ -42,25 +42,26 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
         
         # Extract host name - More specific selectors
         name_selectors = [
-            'h1:text-matches("Hi, I\'m .+")',  # Exact match for "Hi, I'm" pattern
+            'h1:has-text("Hi, I\'m")',
             '[data-testid="host-name"] h1',
             'section:has-text("About") h1',
-            'h1:near([data-testid="host-avatar"])'
         ]
+
         
         for selector in name_selectors:
             try:
                 elem = page.locator(selector).first
-                if elem.is_visible(timeout=2000):
-                    text = elem.inner_text().strip()
-                    if "Hi, I'm" in text:
-                        name = text.replace("Hi, I'm", "").strip()
-                        if name:
-                            profile["name"] = name
-                            logger.info(f"✅ Found host name: {name}")
-                            break
+                elem.wait_for(state="visible", timeout=2000)  # will raise if not visible
+                text = elem.inner_text().strip()
+                if "Hi, I'm" in text:
+                    name = text.replace("Hi, I'm", "").strip()
+                    if name:
+                        profile["name"] = name
+                        logger.info(f"✅ Found host name: {name}")
+                        break
             except Exception:
                 continue
+
         
         # Extract profile photo - More specific
         photo_selectors = [
@@ -75,7 +76,7 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
                 if img.is_visible(timeout=2000):
                     src = img.get_attribute("src")
                     if src and any(keyword in src.lower() for keyword in ["profile", "user", "pictures"]):
-                        profile["profilePhoto"] = src
+                        profile["profile_photo_url"] = src
                         logger.info(f"✅ Found profile photo")
                         break
             except Exception:
@@ -84,10 +85,11 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
         # Extract ACTUAL bio text (NOT reviews) - More specific selectors
         bio_selectors = [
             # Try to find the bio section that's NOT reviews
-            'section:has-text("About") div:not(:has([data-testid="review"])):not(:has(text="reviews")):not(:has(text="Rating")) p',
+            'section:has-text("About") div:not(:has([data-testid="review"])):not(:has-text("reviews")):not(:has-text("Rating")) p',
             'div:has(h2:has-text("About")) + div p:not(:has-text("Rating")):not(:has-text("reviews"))',
             '[data-section-id="HOST_PROFILE_ABOUT"] div p',
-            'section:has(h2:text("About")) div:not([data-testid*="review"]) p',
+            'section:has(h2:has-text("About")) div:not([data-testid*="review"]) p',
+
             # Try to exclude review sections more aggressively  
             'section:has-text("About") div:not(:has-text("★")):not(:has-text("Rating")):not(:has-text("ago")) p'
         ]
@@ -110,11 +112,11 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
                             
                         # Must be substantial text (not just a single word)
                         if len(text) > 30 and len(text.split()) > 5:
-                            profile["about"] = text[:2000]  # Limit length
+                            profile["about_text"] = text[:2000]  # Limit length
                             logger.info(f"✅ Found bio text: {len(text)} characters")
                             break
                             
-                if profile["about"]:
+                if profile["about_text"]:
                     break
                     
             except Exception as e:
@@ -124,8 +126,12 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
         # Extract guidebooks - FIXED selectors
         try:
             # Look for guidebooks section specifically
-            guidebook_section = page.locator('section:has-text("guidebooks"), div:has(h2:has-text("guidebooks")), [data-section-id*="guidebook"]').first
-            
+            guidebook_section = page.locator(
+                    'section:has-text("Guidebook"), section:has-text("guidebooks"), '
+                    'div:has(h2:has-text("Guidebook")), div:has(h2:has-text("guidebooks")), '
+                    '[data-section-id*="guidebook"]'
+                ).first
+
             if guidebook_section.is_visible(timeout=2000):
                 # Find all guidebook links within this section
                 guidebook_links = guidebook_section.locator('a[href*="/guidebooks/"]')
@@ -165,8 +171,8 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
         try:
             # Look for the travel section
             travel_selectors = [
-                'section:has(h2:has-text("Where")) div[data-testid*="place"], div:has(h2:text-matches("Where.*been")) div',
-                'div:has(h2:contains("Where")) div:has(img)',
+                'section:has(h2:has-text("Where")) div[data-testid*="place"], div:has(h2:has-text("Where")) div',
+                'div:has(h2:has-text("Where")) div:has(img)',
                 '[data-section-id*="travel"] div, [data-section-id*="places"] div'
             ]
             
@@ -216,7 +222,7 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
                                         "place": place,
                                         "country": country,
                                         "trips": trips,
-                                        "when": when
+                                        "when_label": when
                                     })
                                     logger.info(f"✅ Found travel: {place}, {country}")
                                     
@@ -315,7 +321,7 @@ def setup_logger() -> logging.Logger:
 
 def connect_db() -> sqlite3.Connection:
     """Open the same SQLite DB your project uses."""
-    return sqlite3.connect(Config.CONFIG_DB_FILE)
+    return sqlite3.connect(HostConfig.CONFIG_DB_FILE)
 
 
 def capture_host_graphql(
@@ -451,13 +457,14 @@ def parse_host_profile_from_jsons(json_blobs: List[Dict[str, Any]], logger: logg
         "identityVerified": 0,
         "languages": [],
         "location": None,
-        "about": None,
+        "about_text": None,
+        "bio_text": None,
         "memberSince": None,
         "ratingAverage": None,
         "ratingCount": 0,
         "responseRate": None,
         "responseTime": None,
-        "profilePhoto": None,
+        "profile_photo_url": None,
         "totalListings": None,
         "guidebooks": [],
         "travels": [],
@@ -466,12 +473,25 @@ def parse_host_profile_from_jsons(json_blobs: List[Dict[str, Any]], logger: logg
 
     # First, populate from DOM fallback if available
     if dom_fallback:
+        # map new keys, but also accept older DOM keys if present
+        key_map = {
+            "profile_photo_url": ("profile_photo_url", "profilePhoto"),
+            "about_text": ("about_text", "about"),
+            "bio_text": ("bio_text", "bio"),
+        }
         for key in profile.keys():
-            dom_key = key
-            if key == "profilePhoto":
-                dom_key = "profilePhoto"
-            if dom_fallback.get(dom_key) is not None:
-                profile[key] = dom_fallback[dom_key]
+            if key in key_map:
+                for cand in key_map[key]:
+                    if dom_fallback.get(cand) is not None:
+                        profile[key] = dom_fallback[cand]
+                        break
+            else:
+                if dom_fallback.get(key) is not None:
+                    profile[key] = dom_fallback[key]
+
+
+
+
         logger.info(f"[PROFILE] Applied DOM fallback data")
 
     # Then enhance with GraphQL data (keep existing logic)

@@ -14,6 +14,7 @@ import multiprocessing
 from openpyxl import Workbook
 import json
 import re
+
 from playwright.sync_api import (
     sync_playwright, Page, BrowserContext, Browser, Route, Request
 )
@@ -27,7 +28,7 @@ from dotenv import load_dotenv
 import os
 
 # Load .env file
-load_dotenv()git remote add origin
+load_dotenv()
 # ------------------------------------------------------------
 # Data Validation Functions (NEW)
 # ------------------------------------------------------------
@@ -355,7 +356,7 @@ def start_scraping(logger: logging.Logger, db: sqlite3.Connection):
     request_monthly_end_date = []
     request_monthly_start_date = []
     request_place_id = []
-    x_airbnb_api_key = os.getenv("AIRBNB_API_Key")
+    x_airbnb_api_key =  "d306zoyjsyarp7ifhu67rjxn52tv0t20"
 
     # PDP detail capture vars
     request_item_token = None
@@ -924,9 +925,9 @@ def main():
         
         # Additional data quality report (NEW)
         try:
-            conn = sqlite3.connect('airbnb_data.db')  # Adjust path as needed
+            conn = sqlite3.connect(Config.CONFIG_DB_FILE)  # Adjust path as needed
             cursor = conn.cursor()
-            
+            cursor.execute("SELECT COUNT(*) FROM listing_tracking")  
             # Price statistics
             cursor.execute("SELECT COUNT(*) FROM listing_tracking WHERE price IS NOT NULL")
             with_prices = cursor.fetchone()[0]
@@ -960,7 +961,7 @@ def run_detailed_scraper():
     logger.info('🔄 Starting detailed scraping session (legacy)…')
     db = Utils.connect_db()
     try:
-        from Main import scrape_detailed_listings  # if present elsewhere
+          # if present elsewhere
         scrape_detailed_listings(logger, db, limit=50)
         logger.info('✅ Detailed scraping session finished')
     except Exception as e:

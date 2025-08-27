@@ -30,10 +30,13 @@ proxy_host = '64.137.96.74'
 proxy_port = 6641
 
 
-
+CONFIG_PROXY = None
 # The correct way to structure the proxy settings for Playwright
+
+'''
 CONFIG_PROXY = {
     "server": f"http://{proxy_host}:{proxy_port}",  # The server is just the host and port
     "username": proxy_username,                    # The username is a separate key
     "password": proxy_password                     # The password is a separate key
 }
+'''
