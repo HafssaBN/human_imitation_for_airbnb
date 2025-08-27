@@ -23,8 +23,8 @@ host_reviews table: This is the "Reviews" shelf.
 
 import sqlite3
 import datetime
-from typing import Iterable, Dict, Any
-
+from typing import List, Dict, Any, Optional,Iterable
+import json 
 from .config import HostConfig 
 
 # -----------------------------
@@ -204,19 +204,187 @@ CREATE TABLE IF NOT EXISTS listing_reviews (
 
 """
 # ---- listing images ----------------------------------
-create_listing_images_table = """
-CREATE TABLE IF NOT EXISTS listing_images_table (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  ListingId  TEXT,
-  Picture    TEXT,
-  FOREIGN KEY (ListingId) REFERENCES listing_tracking(ListingId) ON DELETE CASCADE
-);
-"""
+
+
+
+def create_listing_pictures_table_dynamic():
+    """
+    Create a table that can dynamically add picture columns as needed.
+    We'll start with a reasonable number and expand as needed.
+    """
+    return """
+    CREATE TABLE IF NOT EXISTS listing_pictures (
+        ListingId TEXT PRIMARY KEY,
+        total_pictures INTEGER DEFAULT 0,
+        picture_1 TEXT,
+        picture_2 TEXT,
+        picture_3 TEXT,
+        picture_4 TEXT,
+        picture_5 TEXT,
+        picture_6 TEXT,
+        picture_7 TEXT,
+        picture_8 TEXT,
+        picture_9 TEXT,
+        picture_10 TEXT,
+        picture_11 TEXT,
+        picture_12 TEXT,
+        picture_13 TEXT,
+        picture_14 TEXT,
+        picture_15 TEXT,
+        picture_16 TEXT,
+        picture_17 TEXT,
+        picture_18 TEXT,
+        picture_19 TEXT,
+        picture_20 TEXT,
+        FOREIGN KEY (ListingId) REFERENCES listing_tracking(ListingId) ON DELETE CASCADE
+    );
+    """
+
+def get_max_picture_columns(db: sqlite3.Connection) -> int:
+    """Get the current maximum number of picture columns in the table."""
+    cur = db.cursor()
+    cur.execute("PRAGMA table_info(listing_pictures)")
+    cur.execute("PRAGMA foreign_keys = ON;")
+    columns = cur.fetchall()
+    
+    picture_columns = [col[1] for col in columns if col[1].startswith('picture_')]
+    if not picture_columns:
+        return 0
+    
+    # Extract numbers and find max
+    numbers = []
+    for col in picture_columns:
+        try:
+            num = int(col.split('_')[1])
+            numbers.append(num)
+        except (IndexError, ValueError):
+            continue
+    
+    return max(numbers) if numbers else 0
+
+
+
+
+def add_picture_columns_if_needed(db: sqlite3.Connection, required_columns: int):
+    """Dynamically add picture columns if we need more than currently exist."""
+    current_max = get_max_picture_columns(db)
+    
+    if required_columns <= current_max:
+        return  # We already have enough columns
+    
+    cur = db.cursor()
+    for i in range(current_max + 1, required_columns + 1):
+        column_name = f"picture_{i}"
+        try:
+            cur.execute(f"ALTER TABLE listing_pictures ADD COLUMN {column_name} TEXT")
+            print(f"Added column: {column_name}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+    
+    db.commit()
+
+
 
 create_listing_images_unique_index = """
 CREATE UNIQUE INDEX IF NOT EXISTS ux_listing_images
   ON listing_images_table(ListingId, Picture);
 """
+
+def upsert_listing_pictures_horizontal(db: sqlite3.Connection, listing_id: str, picture_urls: List[str]):
+    """
+    Insert/update pictures for a listing in horizontal format (picture_1, picture_2, etc.)
+    """
+    if not picture_urls:
+        return
+    
+    # Remove duplicates while preserving order
+    unique_pictures = list(dict.fromkeys([url for url in picture_urls if url]))
+    
+    if not unique_pictures:
+        return
+    
+    # Ensure we have enough columns
+    add_picture_columns_if_needed(db, len(unique_pictures))
+    
+    cur = db.cursor()
+    
+    # Build the dynamic SQL
+    columns = ["ListingId", "total_pictures"]
+    values = [listing_id, len(unique_pictures)]
+    placeholders = ["?", "?"]
+    
+    for i, picture_url in enumerate(unique_pictures, 1):
+        column_name = f"picture_{i}"
+        columns.append(column_name)
+        values.append(picture_url)
+        placeholders.append("?")
+    
+    # Create the INSERT OR REPLACE query
+    columns_str = ", ".join(columns)
+    placeholders_str = ", ".join(placeholders)
+    
+    # For UPDATE part, we need to set all picture columns to NULL first, then update with new values
+    max_columns = get_max_picture_columns(db)
+    update_sets = ["total_pictures = excluded.total_pictures"]
+    
+    # Reset all picture columns to NULL
+    for i in range(1, max_columns + 1):
+        update_sets.append(f"picture_{i} = NULL")
+    
+    # Then set the ones we have data for
+    for i in range(1, len(unique_pictures) + 1):
+        update_sets.append(f"picture_{i} = excluded.picture_{i}")
+    
+    update_sets_str = ", ".join(update_sets)
+    
+    query = f"""
+    INSERT INTO listing_pictures ({columns_str})
+    VALUES ({placeholders_str})
+    ON CONFLICT(ListingId) DO UPDATE SET {update_sets_str}
+    """
+    
+    cur.execute(query, values)
+    db.commit()
+    
+    print(f"Updated {listing_id} with {len(unique_pictures)} pictures")
+
+
+def get_listing_pictures(db: sqlite3.Connection, listing_id: str) -> Dict[str, Any]:
+    """Get all pictures for a listing in a structured format."""
+    cur = db.cursor()
+    cur.execute("SELECT * FROM listing_pictures WHERE ListingId = ?", (listing_id,))
+    row = cur.fetchone()
+    
+    if not row:
+        return {"ListingId": listing_id, "total_pictures": 0, "pictures": []}
+    
+    # Get column names
+    cur.execute("PRAGMA table_info(listing_pictures)")
+    columns = [col[1] for col in cur.fetchall()]
+    
+    # Create dict from row
+    row_dict = dict(zip(columns, row))
+    
+    # Extract picture URLs in order
+    pictures = []
+    i = 1
+    while f"picture_{i}" in row_dict:
+        url = row_dict[f"picture_{i}"]
+        if url:  # Only add non-null URLs
+            pictures.append(url)
+        i += 1
+    
+    return {
+        "ListingId": listing_id,
+        "total_pictures": row_dict.get("total_pictures", 0),
+        "pictures": pictures,
+        "raw_data": row_dict  # Include raw data for debugging
+    }
+
+
+
+
 def upsert_listing_images(db: sqlite3.Connection, listing_id: str, picture_urls):
     """Insert all images for a listing (ignores duplicates)."""
     if not picture_urls:
@@ -228,6 +396,17 @@ def upsert_listing_images(db: sqlite3.Connection, listing_id: str, picture_urls)
         rows
     )
     db.commit()
+
+
+
+def replace_listing_images_horizontal(db: sqlite3.Connection, listing_id: str, photos: List[str]):
+    """
+    Replace the old vertical storage with new horizontal storage.
+    This replaces the old replace_listing_images function.
+    """
+    init_pictures_table(db)
+    upsert_listing_pictures_horizontal(db, listing_id, photos)
+
 
 def replace_listing_images(db: sqlite3.Connection, listing_id: str, photos: Iterable[str]):
     init_all_tables(db)
@@ -286,6 +465,26 @@ def _to_float_or_none(v: Any) -> Optional[float]:
         return float(v)
     except (ValueError, TypeError):
         return None
+    
+
+
+
+
+
+def init_pictures_table(db: sqlite3.Connection):
+    """Initialize the pictures table with the new schema."""
+    execute_sql_query_no_results(db, create_listing_pictures_table_dynamic())
+
+# Modified version of the existing function to integrate with the new schema
+
+
+
+
+
+
+
+
+
 def init_all_tables(db: sqlite3.Connection):
     # base
 
@@ -294,8 +493,8 @@ def init_all_tables(db: sqlite3.Connection):
     execute_sql_query_no_results(db, create_listing_index)
     execute_sql_query_no_results(db, create_listing_reviews_table)
     execute_sql_query_no_results(db, create_co_hosts_table)
-    execute_sql_query_no_results(db, create_listing_images_table)
     execute_sql_query_no_results(db, create_listing_images_unique_index)
+    execute_sql_query_no_results(db, create_listing_pictures_table_dynamic())
 
 
     # host + children

@@ -201,73 +201,97 @@ def _extract_travels(page: Page, logger: logging.Logger) -> List[Dict[str, Union
     if results: logger.info(f"✅ Parsed {len(results)} visited places")
     return results
 
-def _extract_some_reviews(page: Page, logger: logging.Logger, max_reviews: int = 0) -> List[Dict[str, Any]]:
-    _click_if_exists(page, ['button:has-text("Show all reviews")'], logger, "Show all reviews")
-    container = page.locator('div[role="dialog"]').first
-    root: Union[Page, Locator] = container if container.count() else page
-    if max_reviews == 0:
-        logger.info("[host] Starting full review extraction. Clicking 'Show more' until all are loaded...")
-        stagnant_clicks, last_count = 0, -1
-        review_selectors = ['div:has(> div:has-text("★")):has(div:has-text("ago"))', 'div:has(span:has-text("★")):has(div:contains("ago"))', '[data-review-id]', 'div:has(img[alt*="avatar"]):has(div:has-text("★"))', 'section:has-text("reviews") div:has(div:has-text("★"))']
-        for click_num in range(50):
-            current_count = 0
-            for selector in review_selectors:
-                try:
-                    count = root.locator(selector).count()
-                    if count > current_count: current_count = count
-                except Exception: continue
-            logger.info(f"[host] Review extraction attempt {click_num + 1}: found {current_count} review blocks")
-            if current_count == last_count and click_num > 0:
-                stagnant_clicks += 1
-                if stagnant_clicks >= 2: logger.info(f"[host] Review count ({current_count}) has not changed for 2 clicks. Assuming all are loaded."); break
-            else: stagnant_clicks = 0
-            last_count = current_count
-            if not _click_if_exists(root, ['button:has-text("Show more reviews")', 'button:has-text("Show more")', 'button[aria-label*="more reviews"]'], logger, f"Show more reviews (found {current_count})"):
-                logger.info("[host] No more 'Show more reviews' button found."); break
-            time.sleep(random.uniform(1.5, 2.5))
-    out: List[Dict[str, Any]] = []
-    review_block_selectors = ['div:has(span:has-text("★")):has(div:has-text("ago"))', 'div:has(div:has-text("★")):has(div:contains("ago"))', 'div:has(img[alt*="avatar"]):has(span:has-text("★"))', 'div:has(img[src*="user"]):has(div:has-text("★"))', 'section:has-text("reviews") > div > div:has(div:has-text("★"))', 'div:has(div[style*="font-weight"]):has(span:has-text("★"))', 'div:has(span:has-text("★")):has(div:has-text("days ago"))', 'div:has(span:has-text("★")):has(div:has-text("weeks ago"))', 'div:has(span:has-text("★")):has(div:has-text("months ago"))']
-    blocks, total = None, 0
-    for selector in review_block_selectors:
-        try:
-            test_blocks = root.locator(selector)
-            test_count = test_blocks.count()
-            if test_count > total: blocks, total = test_blocks, test_count; logger.info(f"[host] Found {total} review blocks using selector: {selector[:50]}...")
-        except Exception as e: logger.debug(f"[host] Selector failed: {selector[:30]}... - {e}"); continue
-    if not blocks or total == 0: logger.warning("[host] No review blocks found with any selector."); return out
-    if max_reviews > 0: total = min(total, max_reviews)
-    logger.info(f"[host] Now scraping details from {total} loaded review blocks.")
-    for i in range(total):
-        try:
-            b = blocks.nth(i)
-            if not b.is_visible(): continue
-            text = b.inner_text().strip()
-            if not text or len(text) < 20: continue
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            if not lines: continue
-            reviewer = None
-            for line in lines[:3]:
-                if len(line) < 50 and not any(keyword in line.lower() for keyword in ["★", "ago", "review", "rating"]): reviewer = line; break
-            if not reviewer: reviewer = lines[0] if lines else None
-            when_line = None
-            for l in lines[:5]:
-                if any(time_word in l.lower() for time_word in ["day", "ago", "today", "week", "month", "year"]) or re.search(r"\b\d{4}\b", l): when_line = l; break
-            rating = None
-            star_match = re.search(r'(\d(?:\.\d)?)\s*(?:★|stars?|out of)', text, re.IGNORECASE)
-            if star_match:
-                try:
-                    rating = float(star_match.group(1))
-                    if rating > 5: rating = rating / 2
-                except Exception: rating = None
-            if rating is None and "★" in text:
-                star_count = text.count("★")
-                if 1 <= star_count <= 5: rating = float(star_count)
-            out.append({"reviewId": f"rev_{i}_{hash(text[:100])%10_000_000}", "sourceListingId": None, "reviewer_name": reviewer, "reviewer_location": None, "rating": rating, "date_text": when_line, "text": text[:2000]})
-        except Exception as e: logger.debug(f"[host] Error extracting review {i}: {e}"); continue
-    if out: logger.info(f"✅ Collected {len(out)} reviews")
-    else: logger.warning("[host] No reviews were successfully extracted despite finding review blocks")
-    return out
+# --- In host_agent.py ---
 
+def _extract_some_reviews(page: Page, logger: logging.Logger, max_reviews: int = 0) -> List[Dict[str, Any]]:
+    """
+    Finds and scrapes all host reviews, intelligently handling both modal and on-page layouts.
+    This version uses a more resilient initial selector to find the reviews container.
+    """
+    try:
+        # --- NEW, MORE ROBUST SELECTOR ---
+        # Instead of 'section', we look for any 'div' containing the h2 reviews heading.
+        # This is more resilient to Airbnb changing container tags.
+        reviews_section_selector = 'div:has(> h2:text-matches("reviews", "i"))'
+        reviews_section = page.locator(reviews_section_selector).first
+
+        if reviews_section.count() == 0:
+            logger.warning("[host] The primary reviews section container could not be found. No reviews will be scraped.")
+            return []
+            
+        logger.info("[host] Scrolling to the reviews section...")
+        reviews_section.scroll_into_view_if_needed()
+        page.wait_for_timeout(1000)
+
+        show_reviews_selector = 'button:text-matches("Show (all|more|[0-9]+).*reviews", "i")'
+        clicked_button = _click_if_exists(reviews_section, [show_reviews_selector], logger, "Show ... reviews button")
+        
+        if not clicked_button:
+            # If the button doesn't exist, the reviews might already be visible, so we don't need to exit.
+            logger.warning("[host] Found the reviews section but could not find a 'Show reviews' button inside it. Will try to scrape visible reviews.")
+
+    except Exception as e:
+        logger.error(f"[host] An error occurred while trying to find and click the reviews button: {e}")
+        return []
+
+    page.wait_for_timeout(3000)
+
+    # (The rest of this function is already robust and should now work correctly)
+    root = None
+    is_modal = False
+    modal_selector = 'div[role="dialog"]:has(h2:text-matches("Reviews", "i"))'
+    
+    if page.locator(modal_selector).is_visible():
+        root = page.locator(modal_selector)
+        is_modal = True
+    else:
+        root = reviews_section
+    
+    if max_reviews == 0:
+        for i in range(50):
+            try:
+                show_more_button = root.locator('button:has-text("Show more reviews")').first
+                if show_more_button.is_visible(timeout=3000):
+                    show_more_button.click(timeout=3000)
+                    page.wait_for_load_state('networkidle', timeout=5000)
+                else: break
+            except Exception: break
+    
+    out: List[Dict[str, Any]] = []
+    review_block_selector = 'div:has(> div h3):has(span[aria-label*="out of 5 stars"])'
+    blocks = root.locator(review_block_selector)
+    total = blocks.count()
+
+    if total > 0:
+        logger.info(f"[host] Found {total} review blocks. Parsing...")
+        for i in range(total):
+            b = blocks.nth(i)
+            try:
+                # (Extraction logic remains the same)
+                reviewer_name = b.locator('h3').first.inner_text().strip()
+                date_text = (b.locator('span:has-text-matches("ago|week|month|year|202", "i")').first.inner_text().strip())
+                text_element = b.locator('span[data-testid="review-text-main-span"], .ll4r2nl').first
+                text = text_element.inner_text().strip() if text_element.count() > 0 else ""
+                rating = None
+                try:
+                    aria_label = b.locator('span[aria-label*="out of 5 stars"]').first.get_attribute('aria-label') or ""
+                    rating_match = re.search(r'Rated\s*(\d\.?\d*)', aria_label)
+                    if rating_match: rating = float(rating_match.group(1))
+                except Exception: pass
+                if text:
+                    out.append({"reviewId": f"rev_{i}_{hash(text[:50])}", "reviewer_name": reviewer_name, "rating": rating, "date_text": date_text, "text": text})
+            except Exception as e: continue
+
+    if out: logger.info(f"✅ Successfully collected {len(out)} reviews.")
+    else: logger.warning("[host] No review data could be extracted.")
+
+    if is_modal:
+        try:
+            root.locator('button[aria-label="Close"]').first.click(timeout=3000)
+        except Exception:
+            page.keyboard.press("Escape")
+
+    return out
 def scrape_host(host_url: str):
     logger = Utils.setup_logger()
     db = Utils.connect_db()
@@ -367,7 +391,9 @@ def scrape_host(host_url: str):
         for item in listing_items[:HOST_MAX]:
             _id = item["listingId"]; processed += 1
             if not SQL.check_if_listing_exists(db, _id):
-                try: SQL.insert_basic_listing(db, {"ListingId": _id, "ListingUrl": item["listingUrl"], "link": item["listingUrl"]})
+                try: SQL.insert_basic_listing(db, {"ListingId": _id, 
+                                                   "ListingUrl": item["listingUrl"],
+                                                     "link": item["listingUrl"]})
                 except Exception as e: logger.warning(f"[host] Could not insert basic listing {_id}: {e}")
             if request_item_token and detailed < HOST_DETAIL_SCRAPE_LIMIT:
                 try:
@@ -378,13 +404,20 @@ def scrape_host(host_url: str):
                             }
                     dd = HostScrapingUtils.scrape_single_result(context=context, item_search_token=request_item_token, listing_info=info, logger=logger, api_key=x_airbnb_api_key, client_version=request_client_version or "", client_request_id=request_item_client_id or "", federated_search_id="", currency="MAD", locale="en", base_headers=request_headers)
                     if not dd.get("skip", False):
+                        dd['checkin'] = checkin_date
+                        dd['checkout'] = checkout_date
                         SQL.update_listing_with_details(db, _id, dd)
                         host_name = dd.get("host")
                         if host_name: SQL.update_host_listing_name(db, user_id, _id, host_name)
                         pics = dd.get("allPictures") or []
                         if pics:
-                            try: SQL.upsert_listing_images(db, _id, pics)
-                            except Exception as e: logger.warning(f"[host] saving images failed for {_id}: {e}")
+                            try:
+                                # Use the new horizontal storage method
+                                from . import host_SQL as SQL_new  # Import updated functions
+                                SQL_new.upsert_listing_pictures_horizontal(db, _id, pics)
+                                logger.info(f"[host] ✅ Stored {len(pics)} pictures for {_id}")
+                            except Exception as e: 
+                                logger.warning(f"[host] saving pictures failed for {_id}: {e}")
                         detailed += 1
                         logger.info(f"[host] ✅ hydrated {_id} | host={host_name or '—'} | photos={len(pics)}")
                         if dd.get("userId") == user_id:
