@@ -19,6 +19,17 @@ from . import host_SQL as SQL
 from . import HostScrapingUtils
 from .HumanMouseMovement import HumanMouseMovement
 
+
+def _safe_profile_payload(base: dict, ab: dict) -> dict:
+    """Only include about/bio if we actually scraped them."""
+    out = base.copy()
+    if ab.get("about_text"):
+        out["about_text"] = ab["about_text"]
+    if ab.get("bio_text"):
+        out["bio_text"] = ab["bio_text"]
+    return out
+
+
 def _classify_listing(dd: dict) -> str:
     """
     Decide ListingObjType using whatever fields we already collect.
@@ -32,12 +43,12 @@ def _classify_listing(dd: dict) -> str:
     if ptype == "LUXE" or pdp == "LUXE" or "LUXE" in tname:
         return "LUXE"
 
-    # 3) Experiences via URL heuristics
+    # Experiences via URL heuristics
     url = (dd.get("ListingUrl") or dd.get("link") or "").lower()
     if "/experiences/" in url or "/s/experiences" in url:
         return "EXPERIENCE"
 
-    # 4) Hotel types (common signals from PDP payloads)
+    # Hotel types (common signals from PDP payloads)
     rtc = (dd.get("roomTypeCategory") or "").lower()  # e.g., "hotel_room"
     if rtc == "hotel_room":
         return "HOTEL_ROOM"
@@ -48,13 +59,14 @@ def _classify_listing(dd: dict) -> str:
     if str(dd.get("isBoutiqueHotel")).lower() in {"1", "true", "yes"}:
         return "BOUTIQUE_HOTEL"
 
-    # 5) Soft heuristics (optional): title hints
+    # Soft heuristics (optional): title hints
     title = (dd.get("title") or "").lower()
     if "hotel" in title:
         return "HOTEL_ROOM"
 
     # Default
     return "REGULAR"
+
 
 def _clean_review_text(raw: str, reviewer_location: Optional[str] = None) -> str:
     if not raw:
@@ -85,6 +97,7 @@ def _get_attr_quick(loc: Locator, name: str, timeout: int = 300) -> Optional[str
         return None
     return None
 
+
 def _inner_text_quick(loc: Locator, timeout: int = 300) -> Optional[str]:
     """Return inner_text fast or None; never blocks for long."""
     try:
@@ -93,6 +106,7 @@ def _inner_text_quick(loc: Locator, timeout: int = 300) -> Optional[str]:
     except Exception:
         return None
     return None
+
 
 def _wait_profile_ready(page: Page, logger: logging.Logger, timeout_ms: int = 15000) -> None:
     try:
@@ -123,7 +137,6 @@ def _extract_first_date(text_block: str) -> Optional[str]:
     """
     Pull a clean date/relative time from a header blob, without 'Rating ...'
     """
-    import re
     if not text_block:
         return None
     # common: "★★★★★ · 1 week ago", "July 2025", "October 2024", etc.
@@ -323,75 +336,324 @@ def _collect_room_links_from_dom(page: Page, logger: logging.Logger, max_scrolls
     logger.info(f"[host] Collected {len(deduped)} unique room links from DOM after {i+1} scrolls")
     return deduped
 
-def _extract_about_and_bio(page: Page, logger: logging.Logger) -> Dict[str, Optional[str]]:
+def _expand_about_block(about_root: Locator, logger: logging.Logger) -> bool:
     """
-    Handles:
-      - new header card (e.g., div.h1oqg76h)
-      - About/À propos/Acerca de/Über/Informazioni su
-      - inline or expandable sections
+    Click every 'Show more/Show all' near the About block, tolerating re-renders.
+    Returns True if the section clearly expanded at least once.
+    """
+    CANDS = [
+        # EN
+        'button:has-text("Show more")','button:has-text("Show all")',
+        'a:has-text("Show more")','a:has-text("Show all")',
+        'span[role="button"]:has-text("Show more")','span[role="button"]:has-text("Show all")',
+        'button:text-matches("^\\s*Show\\s+(all|more)\\b", "i")',
+        'a:text-matches("^\\s*Show\\s+(all|more)\\b", "i")',
+        'span[role="button"]:text-matches("^\\s*Show\\s+(all|more)\\b", "i")',
+        # FR/ES/DE/IT/PT/NL/AR/TR
+        'button:has-text("Afficher plus")','button:has-text("Afficher tout")',
+        'button:has-text("Ver más")','button:has-text("Mehr anzeigen")',
+        'button:has-text("Mostra di più")','button:has-text("Mostrar mais")',
+        'button:has-text("Alles weergeven")',
+        'button:has-text("عرض المزيد")','button:has-text("إظهار المزيد")',
+        'button:has-text("Daha fazla göster")',
+        # Generic role
+        '[role="button"]:has-text("Show more")',
+        '[role="button"]:text-matches("^\\s*Show\\s+(all|more)\\b", "i")',
+    ]
+
+    def _find_btn_near(root: Locator) -> Optional[Locator]:
+        # Scoped first
+        for sel in CANDS:
+            try:
+                b = root.locator(sel).first
+                if b.count() and b.is_visible():
+                    return b
+            except Exception:
+                pass
+        # Page-wide nearest to About heading y
+        try:
+            page = root.page
+            about_y = (root.bounding_box() or {}).get("y", 0) or 0
+            all_btns = page.locator("|".join(CANDS))
+            n = min(all_btns.count(), 25)
+            best, best_dy = None, 1e9
+            for i in range(n):
+                el = all_btns.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    box = el.bounding_box() or {}
+                    dy = abs((box.get("y") or 0) - about_y)
+                    if dy < best_dy:
+                        best_dy, best = dy, el
+                except Exception:
+                    continue
+            return best
+        except Exception:
+            return None
+
+    def _height(loc: Locator) -> float:
+        try:
+            return float((loc.bounding_box() or {}).get("height") or 0.0)
+        except Exception:
+            return 0.0
+
+    expanded_once = False
+    last_h = _height(about_root)
+
+    # Try multiple times—some profiles have 2–3 separate expanders
+    for _ in range(6):
+        btn = _find_btn_near(about_root)
+        if not btn:
+            break
+
+        try:
+            btn.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+
+        # Several strategies
+        clicked = False
+        for how, act in (
+            ("click",     lambda: btn.click(timeout=1500, force=True)),
+            ("js-click",  lambda: btn.evaluate("el => el.click()")),
+            ("enter",     lambda: (btn.focus(), btn.press("Enter", timeout=800))),
+        ):
+            try:
+                act()
+                logger.info(f"[about] expander triggered via {how}")
+                clicked = True
+                break
+            except Exception:
+                continue
+
+        if not clicked:
+            continue
+
+        # Allow the UI to reflow
+        try:
+            about_root.page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+        new_h = _height(about_root)
+        if new_h > last_h + 12:
+            expanded_once = True
+            last_h = new_h
+
+        # If another Show more is still around, loop again
+        more = _find_btn_near(about_root)
+        if not more:
+            break
+
+    return expanded_once
+def _extract_about_and_bio(page: Page, logger: logging.Logger, host_name: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """
+    Extract:
+      • about_text: bullet/kv pairs under “About …”
+      • bio_text: free-form paragraph(s) nearby
+    Works even when there is NO 'Show more' button.
     """
     out: Dict[str, Optional[str]] = {"about_text": None, "bio_text": None}
 
-    # A) Try the top profile card your Selenium code relies on
-    top_card = page.locator('div.h1oqg76h').first
-    if top_card.count():
-        for sel in ['div._1ww3fsj9 span', 'div.a1ftvvwk span', 'div[lang] span', 'p']:
-            el = top_card.locator(sel).first
-            if el.count():
-                try:
-                    txt = el.inner_text().strip()
-                    if txt and len(txt) >= 25:
-                        out["bio_text"] = txt
-                        break
-                except Exception:
-                    pass
+    def _clean(s: str) -> str:
+        s = (s or "").replace("\u00A0", " ").replace("\u202F", " ")
+        return re.sub(r"\s{2,}", " ", s.strip())
 
-    # B) Locate an "About" container by heading/testid/localization
-    about_container = None
-    heading = page.locator(', '.join([
-        'h2:text-matches("^About(\\s+\\S+)?$", "i")',
-        'h2[data-testid*="section-title"]:text-matches("^About", "i")',
-        'h3:text-matches("^About(\\s+\\S+)?$", "i")',
-        'h2:text-matches("^(À propos|Acerca de|Über|Informazioni su)\\b", "i")'
-    ])).first
-    if heading.count():
-        about_container = heading.locator("xpath=ancestor-or-self::*[self::section or self::div][1]").first
-    else:
-        alt = page.locator('[data-testid="user-profile-about"], [data-testid*="about-section"]').first
-        if alt.count():
-            about_container = alt
+    # ---- 1) Locate the “About …” heading ----
+    about_h = page.get_by_role("heading", name=re.compile(r"^\s*About\b", re.I)).first
+    if not about_h.count():
+        about_h = page.locator(':is(h1,h2,h3):text-matches("^\\s*About\\b", "i")').first
+    if not about_h.count():
+        logger.info("[about/bio] No 'About' heading found; skipping.")
+        return out
 
-    if about_container and about_container.count():
-        _click_if_exists(
-            about_container,
-            [
-                'button:has-text("Show all")', 'a:has-text("Show all")',
-                'button:has-text("Afficher plus")', 'button:has-text("Voir tout")',
-                'button:has-text("Mostrar más")'
-            ],
-            logger, "Show all (About)"
-        )
+    # ---- 2) Build a robust search root for the bullets panel ----
+    # Priority: section containing the heading -> nearest following sibling section/div (some layouts split cards)
+    search_roots: List[Locator] = []
+    try:
+        sec = about_h.locator("xpath=ancestor::section[1]").first
+        if sec.count():
+            search_roots.append(sec)
+    except Exception:
+        pass
+    try:
+        par = about_h.locator("xpath=ancestor::*[self::div or self::main][1]").first
+        if par.count():
+            search_roots.append(par)
+    except Exception:
+        pass
+    try:
+        sib = about_h.locator("xpath=following::*[self::section or self::div][1]").first
+        if sib.count():
+            search_roots.append(sib)
+    except Exception:
+        pass
+
+    # De-dup while keeping order
+    seen_ids = set()
+    roots: List[Locator] = []
+    for r in search_roots:
         try:
-            raw = about_container.inner_text().strip()
+            b = r.bounding_box() or {}
+            sig = (round(b.get("x", 0), 1), round(b.get("y", 0), 1), round(b.get("width", 0), 1))
         except Exception:
-            raw = ""
+            sig = id(r)
+        if sig not in seen_ids:
+            roots.append(r)
+            seen_ids.add(sig)
 
-        if raw:
-            lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            if lines and re.match(r"^(About|À propos|Acerca de|Über|Informazioni su)\b", lines[0], re.I):
-                lines = lines[1:]
+    # If for some reason we didn't get anything, at least use the heading itself
+    if not roots:
+        roots = [about_h]
 
-            if not out["bio_text"] and lines:
-                candidate = max(lines, key=len)
-                if len(candidate) >= 25:
-                    out["bio_text"] = candidate
+    # Encourage lazy content to mount
+    try:
+        roots[0].scroll_into_view_if_needed(timeout=1000)
+        page.wait_for_timeout(150)
+    except Exception:
+        pass
 
-            bullets = [l for l in lines if (out["bio_text"] is None or l != out["bio_text"]) and len(l) <= 160]
-            if bullets:
-                out["about_text"] = "\n".join(bullets)
+    # ---- 3) Try to expand (OK if nothing expands) ----
+    expanded = False
+    try:
+        expanded = _expand_about_block(roots[0], logger)
+    except Exception:
+        pass
+    if not expanded:
+        logger.info("[about/bio] no expander or no growth; proceeding with visible content")
 
-    logger.info(f"[host] About parsed -> bullets={len((out['about_text'] or '').splitlines())} | bio_len={len(out['bio_text'] or '')}")
+    # Re-resolve heading/root after possible re-render
+    try:
+        about_h = page.get_by_role("heading", name=re.compile(r"^\s*About\b", re.I)).first or about_h
+        sec = about_h.locator("xpath=ancestor::section[1]").first
+        roots = [sec if sec.count() else about_h.locator("xpath=ancestor::*[self::div or self::main][1]").first]
+    except Exception:
+        pass
+
+    # x-gate to avoid the left profile card
+    try:
+        heading_box = about_h.bounding_box() or {}
+        x_gate = (heading_box.get("x", 0) - 16)
+    except Exception:
+        x_gate = 0
+
+    UI_NOISE = re.compile(r"(?:^|\b)(identity verified|superhost|joined|reviews?|rating|response rate|response time|show all)\b", re.I)
+    CARD_NOISE = re.compile(r"(?:^|\b)(host|month hosting|months? hosting|%\{count\}|about\s+\w+)$", re.I)
+    NUM_ONLY  = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+    ALLOWED_UNLABELED = re.compile(r"^(speaks|lives|i['’]m|i am|i spend|i[’']m obsessed|i’m obsessed|i am obsessed)\b", re.I)
+
+    def iter_all(loc: Locator):
+        try:
+            n = loc.count()
+        except Exception:
+            n = 0
+        for i in range(n):
+            yield loc.nth(i)
+
+    # ---- 4) Parse bio candidates (paragraphs) and bullets from any of the roots ----
+    bio_y = 1e9
+    bio_candidates: List[tuple] = []
+    about_pairs: List[str] = []
+    dedupe = set()
+
+    for about_root in roots:
+        # BIO
+        for el in iter_all(about_root.locator("p, div[lang], blockquote, span")):
+            try:
+                t = _clean(el.inner_text(timeout=700))
+                box = el.bounding_box() or {}
+            except Exception:
+                continue
+            if not t or len(t) < 40:
+                continue
+            if re.match(r"^[^:\n]{1,35}:\s", t):
+                continue
+            if UI_NOISE.search(t) or CARD_NOISE.search(t):
+                continue
+            score = 0
+            if re.search(r"\b(I\s+(am|’m|'m|live|work|travel|enjoy|love|go|like|prefer)|\bmy\s+|As\s+I\b)", t, re.I):
+                score += 10
+            score += min(len(t), 2000) / 120.0
+            bio_candidates.append((score, box.get("y", 1e9), t))
+
+        # BULLETS (icon rows, list items, plain divs)
+        bullet_sel = (
+            ":is([data-testid*='about'], ul li, li, div):has(svg), "
+            "ul li, li, div"
+        )
+        for el in iter_all(about_root.locator(bullet_sel)):
+            try:
+                txt = _clean(el.inner_text(timeout=700))
+                box = el.bounding_box() or {}
+            except Exception:
+                continue
+            if not txt:
+                continue
+
+            # Spatial gates: right column and above bio
+            if box.get("x", x_gate) < x_gate:
+                continue
+            if box.get("y", 0) >= bio_y:
+                continue
+
+            # Text gates
+            if UI_NOISE.search(txt) or CARD_NOISE.search(txt) or NUM_ONLY.match(txt):
+                continue
+            if host_name and re.search(rf"^{re.escape(host_name)}\b", txt, re.I):
+                continue
+            if re.match(r"^About\b", txt, re.I):
+                continue
+
+            item = None
+            if ":" in txt:
+                k, v = txt.split(":", 1)
+                k, v = _clean(k), _clean(v)
+                if 1 <= len(k) <= 50 and len(v) >= 1:
+                    item = f"{k}: {v}"
+            else:
+                if ALLOWED_UNLABELED.match(txt) and len(txt) <= 200:
+                    item = txt
+
+            if item:
+                key = item.lower()
+                if key not in dedupe:
+                    dedupe.add(key)
+                    about_pairs.append(item)
+
+    if bio_candidates:
+        bio_candidates.sort(key=lambda x: (-x[0], x[1]))
+        out["bio_text"] = bio_candidates[0][2]
+        bio_y = bio_candidates[0][1]
+
+    if about_pairs:
+        out["about_text"] = " ; ".join(about_pairs)
+
+    # ---- 5) LAST-RESORT FALLBACK (no expander, strict gates missed) ----
+    if not (out["about_text"] or out["bio_text"]):
+        logger.info("[about/bio] strict parse empty; soft fallback over nearest sibling block")
+        try:
+            # The right column after the card (very common on your screenshot)
+            right_block = about_h.locator("xpath=ancestor::section[1]/following-sibling::*[1]").first
+            blob = (right_block.inner_text(timeout=1200) or "").strip()
+        except Exception:
+            blob = ""
+        lines = [re.sub(r"\s{2,}", " ", l.strip()) for l in (blob.splitlines() if blob else [])]
+        kv = []
+        for l in lines:
+            if ":" in l and len(l) <= 200 and not re.search(r"(reviews?|rating|joined|superhost|identity verified)", l, re.I):
+                k, v = l.split(":", 1)
+                if 1 <= len(k.strip()) <= 50 and len(v.strip()) >= 1:
+                    kv.append(f"{k.strip()}: {v.strip()}")
+        if kv:
+            out["about_text"] = " ; ".join(dict.fromkeys(kv))
+        paras = [p for p in re.split(r"\n\s*\n|•", blob) if len(p.strip()) >= 40]
+        if paras and not out["bio_text"]:
+            out["bio_text"] = max(paras, key=len).strip()
+
+    logger.info(f"[about/bio] about_len={len(out['about_text'] or '')} bio_len={len(out['bio_text'] or '')}")
     return out
+
 
 def _extract_host_reviews_tab_or_modal(page: Page, logger: logging.Logger, max_keep: int = 200) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -673,7 +935,6 @@ def _extract_host_reviews_tab_or_modal(page: Page, logger: logging.Logger, max_k
                 continue
             seen.add(sig)
             out.append({
-              
                 "reviewer_name": name or None,
                 "reviewer_location": location or None,
                 "rating": rating,
@@ -683,6 +944,7 @@ def _extract_host_reviews_tab_or_modal(page: Page, logger: logging.Logger, max_k
 
     logger.info(f"[host] Extracted {len(out)} host reviews")
     return out
+
 
 def _extract_host_reviews_modal(page: Page, logger: logging.Logger, max_keep: int = 150) -> List[Dict[str, Any]]:
     """
@@ -722,7 +984,7 @@ def _extract_host_reviews_modal(page: Page, logger: logging.Logger, max_keep: in
     # Cards: require an h3 (reviewer) and a stars aria-label to avoid false matches
     cards = root.locator('div:has(h3):has([aria-label*="out of 5"])')
     total = min(cards.count(), max_keep)
-    logger.info(f"[host] Found {total} visible review cards")
+    logger.info(f"[host] Found {total if total else 0} visible review cards")  # fixed f-string
 
     seen = set()
     for i in range(total):
@@ -772,7 +1034,6 @@ def _extract_host_reviews_modal(page: Page, logger: logging.Logger, max_keep: in
                     continue
                 seen.add(sig)
                 out.append({
-                
                     "reviewer_name": name,
                     "rating": rating,
                     "date_text": date_text,
@@ -783,6 +1044,7 @@ def _extract_host_reviews_modal(page: Page, logger: logging.Logger, max_keep: in
 
     logger.info(f"[host] Extracted {len(out)} host reviews")
     return out
+
 
 def _extract_guidebooks(page: Page, logger: logging.Logger) -> List[Dict[str, str]]:
     cards, out, seen = page.locator('a[href*="/guidebooks"]'), [], set()
@@ -843,6 +1105,7 @@ def _extract_travels(page: Page, logger: logging.Logger) -> List[Dict[str, Union
     if results:
         logger.info(f"✅ Parsed {len(results)} visited places")
     return results
+
 
 # Optional: Add this to host_agent.py if you want to extract property reviews
 def _extract_property_reviews(page: Page, logger: logging.Logger, max_reviews: int = 200) -> List[Dict[str, Any]]:
@@ -963,7 +1226,6 @@ def _extract_property_reviews(page: Page, logger: logging.Logger, max_reviews: i
 
         if review_text or reviewer_name:
             rows.append({
-               
                 "reviewer_location": reviewer_location,
                 "rating": rating_text,     # SQL._to_float_or_none will normalize if numeric
                 "date_text": date_text,
@@ -1050,7 +1312,6 @@ def _extract_some_reviews(page: Page, logger: logging.Logger, max_reviews: int =
                     pass
                 if text:
                     out.append({
-                
                         "reviewer_name": reviewer_name,
                         "rating": rating,
                         "date_text": date_text,
@@ -1074,6 +1335,7 @@ def _extract_some_reviews(page: Page, logger: logging.Logger, max_reviews: int =
                 pass
 
     return out
+
 
 # ------------------------------- Main runner ---------------------------------
 
@@ -1118,7 +1380,7 @@ def scrape_host(host_url: str):
         context: BrowserContext = browser.new_context(
             viewport={"width": 1400, "height": 900},
             locale="en-US",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9,fr;q=0.7,ar;q=0.6"},
         )
         context = Tarnished.apply_stealth(context)
 
@@ -1165,21 +1427,48 @@ def scrape_host(host_url: str):
         host_name: Optional[str] = None
         profile_photo_url: Optional[str] = None
 
-        # Name (robust selectors for the profile header)
+        # 1) Prefer the name inside the avatar/profile header card
         for sel in [
-            'main h1',                                # new profile header
-            '[data-testid*="user-profile"] h1',
-            'h1:visible'
+            '[data-testid*="user-profile-header"] [data-testid*="name"]',
+            '[data-testid*="user-profile-header"] h1',
+            '[data-testid*="user-profile-header"] h2',
+            'div.h1oqg76h h1',                 # common container for the top card
+            'div.h1oqg76h h2',
+            'div.h1oqg76h [data-testid*="name"]',
         ]:
             try:
                 loc = page.locator(sel).first
                 if loc.count():
                     t = (loc.inner_text(timeout=1500) or "").strip()
-                    if t and len(t) >= 2:
+                    # reject obvious non-names like “Identity verified”, “Host”, or headings
+                    if t and len(t) <= 60 and not re.search(r'\b(Identity verified|Host)\b', t, re.I):
                         host_name = t
                         break
             except Exception:
                 pass
+
+        # 2) Fallback to the page H1 if needed
+        if not host_name:
+            for sel in ['main h1', '[data-testid*="user-profile"] h1', 'h1:visible']:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.count():
+                        t = (loc.inner_text(timeout=1500) or "").strip()
+                        if t:
+                            host_name = t
+                            break
+                except Exception:
+                    pass
+
+        # 3) Normalize: strip “About …” in multiple locales and tidy whitespace
+        if host_name:
+            m = re.match(
+                r'^(?:About|À propos de|À propos d’|À propos d\'|Acerca de|Sobre|Über|Informazioni su)\s+(.+)$',
+                host_name, flags=re.IGNORECASE
+            )
+            if m:
+                host_name = m.group(1).strip()
+            host_name = re.sub(r'\s{2,}', ' ', host_name).strip()
 
         # Avatar (several layouts)
         for sel in [
@@ -1200,7 +1489,7 @@ def scrape_host(host_url: str):
         is_super = 1 if page.locator(':text("Superhost")').count() else 0
         is_ver = 1 if page.locator(':text("Identity verified"), :text("verified")').count() else 0
 
-        ab = _extract_about_and_bio(page, logger)
+        ab = _extract_about_and_bio(page, logger, host_name)
         guidebooks = _extract_guidebooks(page, logger)
 
         if guidebooks:
@@ -1216,23 +1505,19 @@ def scrape_host(host_url: str):
             SQL.upsert_host_reviews(db, user_id, reviews)
             SQL.backfill_host_child_names(db, user_id)
 
-        SQL.upsert_host_profile(
-            db,
-            {
-                "userId": user_id,
-                "userUrl": host_url,
-                "name": host_name,
-                "isSuperhost": is_super,
-                "isVerified": is_ver,
-                "ratingAverage": None,
-                "ratingCount": None,
-                "profile_url": host_url,
-                "scraping_time": int(time.time()),
-                "profile_photo_url": profile_photo_url,
-                "about_text": ab.get("about_text"),
-                "bio_text": ab.get("bio_text"),
-            },
-        )
+        base_profile = {
+            "userId": user_id,
+            "userUrl": host_url,
+            "name": host_name,
+            "isSuperhost": is_super,
+            "isVerified": is_ver,
+            "ratingAverage": None,
+            "ratingCount": None,
+            "profile_url": host_url,
+            "scraping_time": int(time.time()),
+            "profile_photo_url": profile_photo_url,
+        }
+        SQL.upsert_host_profile(db, _safe_profile_payload(base_profile, ab))
 
         human = HumanMouseMovement(page)
         vp = page.viewport_size or {"width": 1400, "height": 900}
@@ -1255,20 +1540,16 @@ def scrape_host(host_url: str):
         except Exception as e:
             logger.warning(f"[host] Failed saving host_listings: {e}")
 
-        SQL.upsert_host_profile(
-            db,
-            {
-                "userId": user_id,
-                "userUrl": host_url,
-                "name":host_name,
-                "total_listings": len(listing_items),
-                "profile_url": host_url,
-                "scraping_time": int(time.time()),
-                "profile_photo_url": profile_photo_url,
-                "about_text": ab.get("about_text"),
-                "bio_text": ab.get("bio_text"),
-            },
-        )
+        base_profile2 = {
+            "userId": user_id,
+            "userUrl": host_url,
+            "name": host_name,
+            "total_listings": len(listing_items),
+            "profile_url": host_url,
+            "scraping_time": int(time.time()),
+            "profile_photo_url": profile_photo_url,
+        }
+        SQL.upsert_host_profile(db, _safe_profile_payload(base_profile2, ab))
 
         if listing_items and not request_item_token:
             _ensure_pdp_token_via_link(context, logger, listing_items[0]["listingUrl"])
@@ -1307,7 +1588,9 @@ def scrape_host(host_url: str):
                         dd["checkin"] = checkin_date
                         dd["checkout"] = checkout_date
                         dd["ListingUrl"] = item["listingUrl"]
-
+                        # NEW: If the profile About/Bio were empty, but PDP exposed a host about text, use it.
+                        if not (ab.get("about_text") or ab.get("bio_text")) and dd.get("hostAboutText"):
+                            ab["about_text"] = dd["hostAboutText"]
                         # Insert as a full listing
                         dd["ListingId"] = _id
                         dd["ListingObjType"] = _classify_listing(dd)
@@ -1316,12 +1599,9 @@ def scrape_host(host_url: str):
                         if not dd.get("userUrl") and dd.get("userId"):
                             dd["userUrl"] = f"https://www.airbnb.com/users/show/{dd['userId']}"
 
-
-
-
                         SQL.insert_new_listing(db, dd)
 
-                        host_name = dd.get("host")
+                        host_name = dd.get("host") or host_name
                         if host_name:
                             SQL.update_host_listing_name(db, user_id, _id, host_name)
 
@@ -1341,27 +1621,26 @@ def scrape_host(host_url: str):
                         detailed += 1
                         logger.info(f"[host] ✅ hydrated {_id} | host={host_name or '—'} | photos={len(pics)}")
 
-                        if dd.get("userId") == user_id:
-                            SQL.upsert_host_profile(
-                                db,
-                                {
-                                    "userId": user_id,
-                                    "userUrl": dd.get("userUrl") or host_url,
-                                    "name": host_name,
-                                    "isSuperhost": int(bool(dd.get("isSuperhost"))),
-                                    "isVerified": int(bool(dd.get("isVerified"))),
-                                    "ratingAverage": dd.get("ratingAverage") or dd.get("hostrAtingAverage"),
-                                    "ratingCount": dd.get("ratingCount"),
-                                    "years": dd.get("years"),
-                                    "months": dd.get("months"),
-                                    "total_listings": len(listing_items),
-                                    "profile_url": host_url,
-                                    "scraping_time": int(time.time()),
-                                    "profile_photo_url": profile_photo_url,
-                                    "about_text": ab.get("about_text"),
-                                    "bio_text": ab.get("bio_text"),
-                                },
-                            )
+                        # Normalize IDs as strings for comparison
+                        _to_str = lambda v: str(v).strip() if v is not None else None
+                        if _to_str(dd.get("userId")) == _to_str(user_id):
+                            base_profile3 = {
+                                "userId": user_id,
+                                "userUrl": dd.get("userUrl") or host_url,
+                                "name": host_name,
+                                "isSuperhost": int(bool(dd.get("isSuperhost"))),
+                                "isVerified": int(bool(dd.get("isVerified"))),
+                                "ratingAverage": dd.get("ratingAverage") or dd.get("hostRatingAverage") or dd.get("hostrAtingAverage"),
+                                "ratingCount": dd.get("ratingCount"),
+                                "years": dd.get("years"),
+                                "months": dd.get("months"),
+                                "total_listings": len(listing_items),
+                                "profile_url": host_url,
+                                "scraping_time": int(time.time()),
+                                "profile_photo_url": profile_photo_url,
+                            }
+                            # Do not overwrite About/Bio here; we already set ab above if needed
+                            SQL.upsert_host_profile(db, _safe_profile_payload(base_profile3, {}))
 
                         SQL.backfill_host_child_names(db, user_id)
                         try:

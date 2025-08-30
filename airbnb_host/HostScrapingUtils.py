@@ -263,13 +263,14 @@ def scrape_single_result(
     )
 
 
-    section_list = root.get("sections", {}).get("sections", [])
+    section_list = ((root.get("sections") or {}).get("sections")) or []
     for sec in section_list:
         if not isinstance(sec, dict):
             continue
 
         try:
-            sid, payload = sec.get("sectionId"), sec.get("section", {})
+            sid = (sec.get("sectionId") or "")
+            payload = sec.get("section") or {}
 
             # Method 2: COMPREHENSIVE PHOTO GALLERY EXTRACTION
             if sid and ("PHOTOGALLERY" in sid or "PHOTO" in sid):
@@ -342,11 +343,18 @@ def scrape_single_result(
                 out["lng"] = payload.get("lng")
 
             elif sid == "MEET_YOUR_HOST":
-                card = payload.get("cardData", {})
+                card = payload.get("cardData") or {}
                 out["host"] = card.get("name")
-                out["isSuperhost"] = card.get("isSuperhost", False)
-                out["isVerified"] = card.get("isVerified", False)
+                out["isSuperhost"] = bool(card.get("isSuperhost"))
+                out["isVerified"] = bool(card.get("isVerified"))
                 out["ratingCount"] = card.get("ratingCount", 0)
+
+                # Try to capture a longer host description if present
+                for key in ("about", "description", "bio", "hostBio", "hostDescription"):
+                    val = card.get(key)
+                    if isinstance(val, str) and len(val.strip()) >= 40:
+                        out["hostAboutText"] = val.strip()
+                        break
 
                 user_id_b64 = card.get("userId")
                 if user_id_b64:
@@ -358,10 +366,11 @@ def scrape_single_result(
                 if out["userId"]:
                     out["userUrl"] = f"https://www.airbnb.com/users/show/{out['userId']}"
 
-                time_as_host = card.get("timeAsHost", {})
+                time_as_host = card.get("timeAsHost") or {}
                 out["years"] = time_as_host.get("years", 0)
                 out["months"] = time_as_host.get("months", 0)
                 out["hostrAtingAverage"] = card.get("ratingAverage", 0.0)
+
 
                 # co-hosts present but not used downstream; kept for completeness
                 for ch in (card.get("coHosts") or []):
