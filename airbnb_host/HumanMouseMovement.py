@@ -1,4 +1,4 @@
-# HumanMouseMovement.py
+
 from playwright.sync_api import Page
 from math import sqrt, atan2, cos, sin
 import time

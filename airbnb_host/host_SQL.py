@@ -38,15 +38,9 @@ CREATE TABLE IF NOT EXISTS listing_tracking (
   ListingId TEXT PRIMARY KEY,
   ListingUrl TEXT UNIQUE,
   ListingObjType TEXT,
-  roomTypeCategory TEXT,
   title TEXT,
-  name TEXT,
   picture TEXT,
-  checkin TEXT,
-  checkout TEXT,
-  price TEXT,
-  discounted_price TEXT,
-  original_price TEXT,
+
   link TEXT,
   scraping_time INTEGER,
   needs_detail_scraping INTEGER DEFAULT 0,
@@ -54,7 +48,8 @@ CREATE TABLE IF NOT EXISTS listing_tracking (
   reviewsCount INTEGER,
   averageRating REAL,
   host TEXT,
-  Urlhost TEXT,
+  userId TEXT,
+  userUrl TEXT,
   airbnbLuxe TEXT,
   location TEXT,
   maxGuestCapacity INTEGER,
@@ -64,8 +59,7 @@ CREATE TABLE IF NOT EXISTS listing_tracking (
   isSuperhost TEXT,
   isVerified TEXT,
   ratingCount TEXT,
-  userId TEXT,
-  userUrl TEXT,
+ 
   years INTEGER,
   months INTEGER,
   hostrAtingAverage REAL
@@ -77,20 +71,8 @@ CREATE TABLE IF NOT EXISTS listing_tracking (
 create_listing_index = """CREATE INDEX IF NOT EXISTS idx_listing ON listing_tracking(ListingId);"""
   
 
-# ---- co-hosts per listing ----------------------------
 
-create_co_hosts_table = """
-CREATE TABLE IF NOT EXISTS co_hosts (
-  ListingId       TEXT,
-  co_host_id      TEXT,
-  co_host_name    TEXT,
-  co_host_url     TEXT,
-  co_host_picture TEXT,
-  PRIMARY KEY (ListingId, co_host_id),
-  FOREIGN KEY (ListingId) REFERENCES listing_tracking(ListingId) ON DELETE CASCADE
-);
 
-"""
 
 
 # ---- hosts (parent) --------------------------------------------
@@ -173,36 +155,21 @@ CREATE TABLE IF NOT EXISTS host_travels (
 
 create_host_reviews_table = """
 CREATE TABLE IF NOT EXISTS host_reviews (
-  userId TEXT,
-  name TEXT,
-  reviewId TEXT,
-  sourceListingId TEXT,
-  reviewer_name TEXT,
-  reviewer_location TEXT,
-  rating REAL,
-  date_text TEXT,
-  text TEXT,
-  PRIMARY KEY (userId, reviewId),
-  FOREIGN KEY (userId) REFERENCES host_tracking (userId) ON DELETE CASCADE
-);
-"""
-
-create_listing_reviews_table = """
-CREATE TABLE IF NOT EXISTS listing_reviews (
-  ListingId         TEXT,
-  reviewId          TEXT,
-  userId            TEXT,
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,   -- unique row ID
+  userId            TEXT NOT NULL,                       -- which host this belongs to
+  name              TEXT,                                -- host name (optional)
   reviewer_name     TEXT,
   reviewer_location TEXT,
   rating            REAL,
   date_text         TEXT,
   text              TEXT,
-  sourceListingId   TEXT,
-  PRIMARY KEY (ListingId, reviewId),
-  FOREIGN KEY (ListingId) REFERENCES listing_tracking(ListingId) ON DELETE CASCADE
+  FOREIGN KEY (userId) REFERENCES host_tracking (userId) ON DELETE CASCADE
 );
 
+
 """
+
+
 # ---- listing images ----------------------------------
 
 
@@ -244,7 +211,6 @@ def get_max_picture_columns(db: sqlite3.Connection) -> int:
     """Get the current maximum number of picture columns in the table."""
     cur = db.cursor()
     cur.execute("PRAGMA table_info(listing_pictures)")
-    cur.execute("PRAGMA foreign_keys = ON;")
     columns = cur.fetchall()
     
     picture_columns = [col[1] for col in columns if col[1].startswith('picture_')]
@@ -290,6 +256,40 @@ create_listing_images_unique_index = """
 CREATE UNIQUE INDEX IF NOT EXISTS ux_listing_images
   ON listing_images_table(ListingId, Picture);
 """
+
+
+
+
+def upsert_listing_reviews(db: sqlite3.Connection, listing_id: str, items: Iterable[Dict[str, Any]]):
+    """Saves reviews that belong to a specific listing."""
+    cur = db.cursor()
+    
+    payload = []
+    for i in items:
+        
+        if not review_id:
+            continue
+        payload.append((
+            listing_id,
+            review_id,
+            i.get("reviewer_name"),
+            _to_float_or_none(i.get("rating")),
+            i.get("date_text"),
+            i.get("text"),
+        ))
+    if payload:
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO listing_reviews
+              (ListingId,  reviewer_name, rating, date_text, text)
+            VALUES (?, ?,  ?, ?, ?)
+            """,
+            payload,
+        )
+        db.commit()
+
+
+
 
 def upsert_listing_pictures_horizontal(db: sqlite3.Connection, listing_id: str, picture_urls: List[str]):
     """
@@ -491,9 +491,6 @@ def init_all_tables(db: sqlite3.Connection):
    
     execute_sql_query_no_results(db, create_listing_tracking_table)
     execute_sql_query_no_results(db, create_listing_index)
-    execute_sql_query_no_results(db, create_listing_reviews_table)
-    execute_sql_query_no_results(db, create_co_hosts_table)
-    execute_sql_query_no_results(db, create_listing_images_unique_index)
     execute_sql_query_no_results(db, create_listing_pictures_table_dynamic())
 
 
@@ -521,17 +518,17 @@ def insert_new_listing(db: sqlite3.Connection, data: dict):
 
     query = """
       INSERT OR REPLACE INTO listing_tracking (
-        ListingId,ListingUrl, ListingObjType, roomTypeCategory, title, name, picture, checkin, checkout,
-        price, discounted_price, original_price, link, scraping_time,
+        ListingId,ListingUrl, ListingObjType,  title,  picture, 
+        link, scraping_time,
         needs_detail_scraping, has_detailed_data,
-        reviewsCount, averageRating, host, airbnbLuxe, location, maxGuestCapacity, isGuestFavorite,
-        lat, lng, isSuperhost, isVerified, ratingCount, userId, years, months, hostrAtingAverage
+        reviewsCount, averageRating, host,userId, userUrl, airbnbLuxe, location, maxGuestCapacity, isGuestFavorite,
+        lat, lng, isSuperhost, isVerified, ratingCount,  years, months, hostrAtingAverage
       ) VALUES (
-        :ListingId, :ListingUrl, :ListingObjType, :roomTypeCategory, :title, :name, :picture, :checkin, :checkout,
-        :price, :discounted_price, :original_price, :link, :scraping_time,
+        :ListingId, :ListingUrl, :ListingObjType,  :title,  :picture, 
+         :link, :scraping_time,
         :needs_detail_scraping, :has_detailed_data,
-        :reviewsCount, :averageRating, :host, :airbnbLuxe, :location, :maxGuestCapacity, :isGuestFavorite,
-        :lat, :lng, :isSuperhost, :isVerified, :ratingCount, :userId, :years, :months, :hostrAtingAverage
+        :reviewsCount, :averageRating, :host,:userId, :userUrl, :airbnbLuxe, :location, :maxGuestCapacity, :isGuestFavorite,
+        :lat, :lng, :isSuperhost, :isVerified, :ratingCount,  :years, :months, :hostrAtingAverage
       )
     """
     db.cursor().execute(query, data)
@@ -544,27 +541,26 @@ def insert_basic_listing(db: sqlite3.Connection, data: dict):
     data['needs_detail_scraping'] = 1
 
     defaults = {
-        'reviewsCount': 0, 'averageRating': 0.0, 'host': None, 'Urlhost': None, 'airbnbLuxe': None,
+        'reviewsCount': 0, 'averageRating': 0.0, 'host': None,  'airbnbLuxe': None,
         'location': None, 'maxGuestCapacity': 0, 'isGuestFavorite': None, 'lat': None, 'lng': None,
         'isSuperhost': None, 'isVerified': None, 'ratingCount': 0, 'userId': None, 'userUrl': None,
         'years': 0, 'months': 0, 'hostrAtingAverage': 0.0, 'ListingObjType': 'REGULAR',
-        'roomTypeCategory': None, 'title': None, 'name': None, 'picture': None, 'checkin': None,
-        'checkout': None, 'price': None, 'discounted_price': None, 'original_price': None,
+         'title': None,  'picture': None, 
     }
     for k, v in defaults.items():
         data.setdefault(k, v)
 
     query = """
       INSERT OR REPLACE INTO listing_tracking (
-        ListingId, ListingUrl, ListingObjType, roomTypeCategory, title, name, picture,
-        checkin, checkout, price, discounted_price, original_price, link, scraping_time,
-        needs_detail_scraping, has_detailed_data, reviewsCount, averageRating, host, Urlhost,
+        ListingId, ListingUrl, ListingObjType, title,  picture,
+        link, scraping_time,
+        needs_detail_scraping, has_detailed_data, reviewsCount, averageRating, host, 
         airbnbLuxe, location, maxGuestCapacity, isGuestFavorite, lat, lng, isSuperhost, isVerified,
         ratingCount, userId, userUrl, years, months, hostrAtingAverage
       ) VALUES (
-        :ListingId, :ListingUrl, :ListingObjType, :roomTypeCategory, :title, :name, :picture,
-        :checkin, :checkout, :price, :discounted_price, :original_price, :link, :scraping_time,
-        :needs_detail_scraping, :has_detailed_data, :reviewsCount, :averageRating, :host, :Urlhost,
+        :ListingId, :ListingUrl, :ListingObjType,  :title,  :picture,
+         :link, :scraping_time,
+        :needs_detail_scraping, :has_detailed_data, :reviewsCount, :averageRating, :host, 
         :airbnbLuxe, :location, :maxGuestCapacity, :isGuestFavorite, :lat, :lng, :isSuperhost, :isVerified,
         :ratingCount, :userId, :userUrl, :years, :months, :hostrAtingAverage
       )
@@ -583,8 +579,8 @@ def update_listing_with_details(db: sqlite3.Connection, listing_id: str, detail_
 
 
     # Defaults for optional fields we now persist
-    for k in ("title","roomTypeCategory","picture","checkin","checkout",
-              "price","discounted_price","original_price", "Urlhost", "userUrl"):
+    for k in ("title","picture",
+               "userUrl"):
         detail_data.setdefault(k, None)
 
 
@@ -592,18 +588,13 @@ def update_listing_with_details(db: sqlite3.Connection, listing_id: str, detail_
     query = """
       UPDATE listing_tracking SET
         title=:title,
-        roomTypeCategory=:roomTypeCategory,
         picture=:picture,
-        checkin=:checkin,
-        checkout=:checkout,
-        price=:price,
-        discounted_price=:discounted_price,
-        original_price=:original_price,
-
+       
+   
         reviewsCount=:reviewsCount,
         averageRating=:averageRating,
         host=:host,
-        Urlhost=:Urlhost,
+       
         airbnbLuxe=:airbnbLuxe,
         location=:location,
         maxGuestCapacity=:maxGuestCapacity,
@@ -618,7 +609,7 @@ def update_listing_with_details(db: sqlite3.Connection, listing_id: str, detail_
         years=:years,
         months=:months,
         hostrAtingAverage=:hostrAtingAverage,
-
+        ListingObjType=:ListingObjType,
         has_detailed_data=:has_detailed_data,
         needs_detail_scraping=:needs_detail_scraping
       WHERE ListingId=:ListingId
@@ -723,27 +714,6 @@ def set_host_name_for_listings(db: sqlite3.Connection, user_id: str, host_name: 
     db.commit()
 
 
-def upsert_cohosts(db: sqlite3.Connection, listing_id: str, cohosts: Iterable[Dict[str, Any]]):
-    """Insert/replace co-host rows for a listing."""
-    if not cohosts:
-        return
-    cur = db.cursor()
-    payload = []
-    for ch in cohosts:
-        payload.append((
-            str(listing_id),
-            ch.get("co_host_id"),
-            ch.get("co_host_name"),
-            ch.get("co_host_url"),
-            ch.get("co_host_picture"),
-        ))
-    cur.executemany(
-        """INSERT OR REPLACE INTO co_hosts
-           (ListingId, co_host_id, co_host_name, co_host_url, co_host_picture)
-           VALUES (?, ?, ?, ?, ?)""",
-        payload,
-    )
-    db.commit()
 
 def update_host_listing_name(db: sqlite3.Connection, user_id: str, listing_id: str, host_name: str):
     """Set the name for a specific host/listing row."""
@@ -837,40 +807,31 @@ def set_host_name_for_reviews(db, user_id: str, host_name: str):
     cur = db.cursor()
     cur.execute("UPDATE host_reviews SET name=? WHERE userId=?", (host_name, user_id))
     db.commit()
-def upsert_host_reviews(db: sqlite3.Connection, user_id: str, items: Iterable[Dict[str, Any]]):
-    cur = db.cursor()
 
-    # fetch once
-    cur.execute("SELECT name FROM host_tracking WHERE userId=?", (user_id,))
-    row = cur.fetchone()
-    host_name = row[0] if row else None
-
-    payload = []
-    for i in items:
-        review_id = i.get("reviewId")
-        if not review_id:
-            continue
-        payload.append((
-            user_id,
-            host_name,                     # <— new
-            review_id,
-            i.get("sourceListingId"),
-            i.get("reviewer_name"),
-            i.get("reviewer_location"),
-            _to_float_or_none(i.get("rating")),
-            i.get("date_text"),
-            i.get("text"),
+def upsert_host_reviews(db, user_id: str, reviews: list, host_name: str | None = None):
+    rows = []
+    for r in reviews:
+        rows.append((
+            user_id,                              # userId
+            host_name,                            # name  (can be None)
+            r.get("reviewer_name"),
+            r.get("reviewer_location"),
+            r.get("rating"),
+            r.get("date_text"),
+            r.get("text"),
         ))
-    if payload:
-        cur.executemany(
-            """
-            INSERT OR REPLACE INTO host_reviews
-              (userId, name, reviewId, sourceListingId, reviewer_name, reviewer_location, rating, date_text, text)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            payload,
-        )
-        db.commit()
+
+    cur = db.cursor()
+    cur.executemany(
+        """
+        INSERT OR REPLACE INTO host_reviews
+          (userId, name,   reviewer_name, reviewer_location, rating, date_text, text)
+        VALUES (  ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    db.commit()
+
 
 
 # -----------------------------

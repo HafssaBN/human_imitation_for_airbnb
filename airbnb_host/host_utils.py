@@ -1,4 +1,4 @@
-# host_utils.py - FIXED VERSION WITH PROPER SELECTORS
+
 import json
 import logging
 import sqlite3
@@ -82,38 +82,45 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
             except Exception:
                 continue
         
-        # Extract ACTUAL bio text (NOT reviews) - More specific selectors
-        bio_selectors = [
-            # Try to find the bio section that's NOT reviews
-            'section:has-text("About") div:not(:has([data-testid="review"])):not(:has-text("reviews")):not(:has-text("Rating")) p',
-            'div:has(h2:has-text("About")) + div p:not(:has-text("Rating")):not(:has-text("reviews"))',
-            '[data-section-id="HOST_PROFILE_ABOUT"] div p',
-            'section:has(h2:has-text("About")) div:not([data-testid*="review"]) p',
-
-            # Try to exclude review sections more aggressively  
-            'section:has-text("About") div:not(:has-text("★")):not(:has-text("Rating")):not(:has-text("ago")) p'
-        ]
         
+
+# Extract ACTUAL bio text (NOT page UI elements) - Fixed selectors
+        bio_selectors = [
+            # Look for paragraphs in About section that contain substantial text
+            'section:has(h1:has-text("About")) p:not(:has([aria-label])):not(:has(button))',
+            'section:has(h2:has-text("About")) p:not(:has([aria-label])):not(:has(button))',
+            # Avoid UI elements like ratings, buttons, etc.
+            'div[data-section-id*="HOST_PROFILE"] p:not(:has-text("Rating")):not(:has-text("reviews")):not(:has-text("★"))',
+            # Look for longer text blocks that aren't navigation or UI
+            'section:has-text("About") div:not([role="button"]):not([aria-label]) p',
+        ]
+
         for selector in bio_selectors:
             try:
                 elems = page.locator(selector)
                 count = elems.count()
                 
-                for i in range(min(count, 5)):  # Check first 5 matches
+                for i in range(min(count, 3)):  # Check first 3 matches
                     elem = elems.nth(i)
                     if elem.is_visible(timeout=1000):
                         text = elem.inner_text().strip()
                         
-                        # Skip if it looks like review content
-                        skip_keywords = ["rating", "★", "ago", "days ago", "weeks ago", "months ago", 
-                                       "review", "stayed", "recommend", "host was", "accommodation"]
-                        if any(keyword in text.lower() for keyword in skip_keywords):
+                        # Skip UI elements and navigation text
+                        skip_patterns = [
+                            "reviews", "rating", "★", "host", "superhost", "verified",
+                            "month", "year", "hosting", "born in", "work:", "school:",
+                            "lives in", "identity", "where i went"
+                        ]
+                        
+                        # Check if text looks like UI content
+                        text_lower = text.lower()
+                        if any(pattern in text_lower for pattern in skip_patterns):
                             continue
-                            
-                        # Must be substantial text (not just a single word)
-                        if len(text) > 30 and len(text.split()) > 5:
-                            profile["about_text"] = text[:2000]  # Limit length
-                            logger.info(f"✅ Found bio text: {len(text)} characters")
+                        
+                        # Must be substantial biographical text
+                        if len(text) > 50 and len(text.split()) > 8 and not text_lower.startswith(("hi,", "hello,")):
+                            profile["about_text"] = text[:1000]  # Limit length
+                            logger.info(f"Found bio text: {len(text)} characters")
                             break
                             
                 if profile["about_text"]:
@@ -123,6 +130,9 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
                 logger.debug(f"Bio selector failed: {e}")
                 continue
         
+
+
+
         # Extract guidebooks - FIXED selectors
         try:
             # Look for guidebooks section specifically
@@ -494,8 +504,6 @@ def parse_host_profile_from_jsons(json_blobs: List[Dict[str, Any]], logger: logg
 
         logger.info(f"[PROFILE] Applied DOM fallback data")
 
-    # Then enhance with GraphQL data (keep existing logic)
-    # ... rest of the function remains the same
 
     found_fields = [k for k, v in profile.items() if v]
     logger.info(f"[PROFILE] Final profile has {len(found_fields)} fields: {', '.join(found_fields)}")

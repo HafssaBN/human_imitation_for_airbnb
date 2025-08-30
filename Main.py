@@ -356,7 +356,7 @@ def start_scraping(logger: logging.Logger, db: sqlite3.Connection):
     request_monthly_end_date = []
     request_monthly_start_date = []
     request_place_id = []
-    x_airbnb_api_key =  "d306zoyjsyarp7ifhu67rjxn52tv0t20"
+    x_airbnb_api_key =  
 
     # PDP detail capture vars
     request_item_token = None
@@ -893,7 +893,7 @@ def main():
     
     # Enhanced startup logging (NEW)
     logger.info('🚀 Airbnb scraper started with enhanced validation...')
-    logger.info(f'📊 Limits: MAX_LISTINGS_PER_RUN={getattr(Config, "MAX_LISTINGS_PER_RUN", 3)}, DETAIL_SCRAPE_LIMIT={getattr(Config, "DETAIL_SCRAPE_LIMIT", 3)}')
+    logger.info(f'📊 Limits: MAX_LISTINGS_PER_RUN={getattr(Config, "MAX_LISTINGS_PER_RUN", 10)}, DETAIL_SCRAPE_LIMIT={getattr(Config, "DETAIL_SCRAPE_LIMIT", 3)}')
     
     db = Utils.connect_db()
 
