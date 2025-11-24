@@ -1,4 +1,3 @@
-
 import base64
 import json
 import logging
@@ -124,6 +123,287 @@ def _dismiss_any_popups_enhanced(page: Page, logger: Optional[logging.Logger] = 
     return True
 
 
+def _scrape_images_from_dom(context: BrowserContext, url: str, logger: logging.Logger, max_imgs: int = 200) -> List[str]:
+    """
+    Fallback: Open PDP, click 'Show all photos', scrape WHILE scrolling using Keyboard.
+    """
+    page = context.new_page()
+    collected_urls = set()
+    
+    try:
+        logger.info(f"[PDP DOM] Opening PDP to collect images: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        _dismiss_any_popups_enhanced(page, logger, max_attempts=3)
+
+        # --- STEP 1: CLICK "SHOW ALL PHOTOS" ---
+        grid_button_clicked = False
+        trigger_selectors = [
+            '[data-testid="photogallery-grid-view-nearby-button"]',
+            'button:has-text("Show all photos")',
+            'button[aria-label="Show all photos"]',
+        ]
+
+        for sel in trigger_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() and btn.is_visible():
+                    logger.info(f"[PDP DOM] Found gallery button via '{sel}'. Force clicking...")
+                    btn.click(timeout=4000, force=True)
+                    
+                    # Wait for animation
+                    page.wait_for_timeout(2500)
+                    
+                    # --- FIX FOR TRANSLATION POPUP ---
+                    # Force press Escape to close any overlapping "Translation on" popups
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(500)
+                    # ---------------------------------
+
+                    # Detect if modal is truly open
+                    if page.locator('[data-testid="photo-viewer-section"]').count() > 0 or \
+                       page.locator('div[role="dialog"][aria-label*="Photo"]').count() > 0:
+                        logger.info("[PDP DOM] Photo gallery modal detected open.")
+                        grid_button_clicked = True
+                        break
+            except Exception:
+                continue
+
+        # --- STEP 2: SCROLL & SCRAPE (PROGRESSIVE) ---
+        # We scrape INSIDE the loop to catch images before they unload (virtual scrolling)
+        loops = 60 if grid_button_clicked else 20
+        logger.info(f"[PDP DOM] Starting keyboard-driven scroll (Modal: {grid_button_clicked}, Loops: {loops})...")
+
+        # If modal is open, click inside it to ensure keyboard focus
+        if grid_button_clicked:
+            try:
+                page.click('div[role="dialog"]', timeout=1000, force=True)
+            except Exception:
+                pass
+
+        image_selectors = [
+            '[data-testid="photo-viewer-section"] img', 
+            'div[role="dialog"] img',                   
+            '[data-testid="main-gallery-grid"] img',    
+            'img[src*="imagedelivery"]',
+            'picture img',
+        ]
+
+        for i in range(loops):
+            # 1. Scrape what is currently visible
+            try:
+                for sel in image_selectors:
+                    elements = page.locator(sel).all()
+                    for el in elements:
+                        src = el.get_attribute("src")
+                        if not src: continue
+                        
+                        src = src.strip()
+                        lower_src = src.lower()
+
+                        # Filter junk
+                        if "/pictures/user/" in lower_src: continue
+                        if "airbnb-platform-assets" in lower_src: continue
+                        if "static/packages" in lower_src: continue
+
+                        clean_url = src.split("?")[0]
+                        collected_urls.add(clean_url)
+            except Exception:
+                pass
+
+            # Stop if we have plenty
+            if len(collected_urls) >= max_imgs:
+                break
+
+            # 2. Scroll using Keyboard (Robust)
+            try:
+                if grid_button_clicked:
+                    # Press PageDown twice to move faster
+                    page.keyboard.press("PageDown")
+                    page.wait_for_timeout(100)
+                    page.keyboard.press("PageDown")
+                else:
+                    # Main page scroll
+                    page.mouse.wheel(0, 3000)
+                
+                # Wait for network lazy load
+                page.wait_for_timeout(400)
+            except Exception:
+                break
+
+        final_list = list(collected_urls)
+        logger.info(f"[PDP DOM] Collected {len(final_list)} unique image URLs")
+        return final_list
+
+    except Exception as e:
+        logger.info(f"[PDP DOM] Fallback failed: {e}")
+        return []
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+def _scrape_details_from_dom(context: BrowserContext, url: str, logger: logging.Logger) -> Dict[str, Any]:
+    """
+    Open PDP and extract details.
+    1. Tries to parse hidden 'niobeClientData' JSON (FAST & ACCURATE).
+    2. Falls back to visual scraping if JSON is missing.
+    """
+    page = context.new_page()
+    details: Dict[str, Any] = {
+        "title": None,
+        "location": None,
+        "roomTypeCategory": None,
+        "maxGuestCapacity": 0,
+        "isGuestFavorite": False,
+        "reviewsCount": 0,
+        "averageRating": 0.0,
+        "lat": None,
+        "lng": None,
+        "host": None,
+        "userId": None,
+        "userUrl": None,
+        "isSuperhost": False,
+        "isVerified": False,
+        "ratingCount": 0,
+        "hostrAtingAverage": 0.0,
+        "years": 0,
+        "months": 0,
+        "allPictures": [] 
+    }
+    
+    try:
+        logger.info(f"[PDP DOM] Opening PDP for details: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        _dismiss_any_popups_enhanced(page, logger, max_attempts=3)
+        
+        # --- STRATEGY 1: PARSE EMBEDDED JSON ---
+        try:
+            script_content = page.locator('#data-deferred-state-0').inner_text()
+            
+            if script_content:
+                json_data = json.loads(script_content)
+                niobe_data = json_data.get("niobeClientData", [])
+                
+                for item in niobe_data:
+                    if not isinstance(item, list) or len(item) < 2: continue
+                    payload = item[1]
+                    if not isinstance(payload, dict): continue
+                    
+                    data_root = payload.get("data", {}).get("presentation", {}).get("stayProductDetailPage", {})
+                    if not data_root: continue
+                    
+                    sections = data_root.get("sections", {}).get("sections", [])
+                    for sec in sections:
+                        sec_data = sec.get("section", {})
+                        sec_id = sec.get("sectionId", "")
+
+                        # 1. HOST DETAILS
+                        if sec_id == "MEET_YOUR_HOST" or "HOST_OVERVIEW" in sec_id:
+                            card = sec_data.get("cardData", {})
+                            if card:
+                                details["host"] = card.get("name")
+                                details["isSuperhost"] = bool(card.get("isSuperhost"))
+                                details["isVerified"] = bool(card.get("isVerified"))
+                                
+                                time_host = card.get("timeAsHost", {})
+                                details["years"] = time_host.get("years", 0)
+                                details["months"] = time_host.get("months", 0)
+                                
+                                if card.get("ratingAverage"):
+                                    details["hostrAtingAverage"] = float(card.get("ratingAverage"))
+                                if card.get("ratingCount"):
+                                    details["ratingCount"] = int(card.get("ratingCount"))
+
+                                # ID FIX
+                                raw_uid = card.get("userId")
+                                raw_context_uid = card.get("contextualUserId")
+                                target_id_raw = raw_context_uid if raw_context_uid else raw_uid
+                                
+                                if target_id_raw:
+                                    if "User" in target_id_raw and not target_id_raw.isdigit():
+                                        try:
+                                            decoded = base64.b64decode(target_id_raw).decode('utf-8')
+                                            details["userId"] = decoded.split(":")[-1]
+                                        except: 
+                                            details["userId"] = target_id_raw
+                                    else:
+                                        details["userId"] = target_id_raw
+                                        
+                                if details["userId"]:
+                                    details["userUrl"] = f"https://www.airbnb.com/users/show/{details['userId']}"
+                        
+                        # 2. IMAGES (Photos)
+                        if "PHOTO" in sec_id or "HERO" in sec_id:
+                            media_items = sec_data.get("mediaItems") or sec_data.get("previewImages") or []
+                            for img in media_items:
+                                if isinstance(img, dict):
+                                    u = img.get("baseUrl") or img.get("url")
+                                    if u:
+                                        details["allPictures"].append(u)
+
+                        # 3. REVIEWS & RATING
+                        if sec_id == "REVIEWS_DEFAULT":
+                            details["reviewsCount"] = sec_data.get("overallCount") or details["reviewsCount"]
+                            details["averageRating"] = sec_data.get("overallRating") or details["averageRating"]
+                            details["isGuestFavorite"] = bool(sec_data.get("isGuestFavorite"))
+
+                        # 4. LOCATION
+                        if sec_id == "LOCATION_DEFAULT":
+                            details["lat"] = sec_data.get("lat")
+                            details["lng"] = sec_data.get("lng")
+                            if sec_data.get("subtitle"):
+                                details["location"] = sec_data.get("subtitle")
+                            elif sec_data.get("previewLocationDetails"):
+                                try:
+                                    details["location"] = sec_data["previewLocationDetails"][0]["title"]
+                                except: pass
+
+                        # 5. TITLE
+                        if sec_id == "TITLE_DEFAULT":
+                            details["title"] = sec_data.get("title")
+                            details["roomTypeCategory"] = sec_data.get("roomTypeCategory")
+
+                        # 6. CAPACITY
+                        if "AVAILABILITY" in sec_id:
+                            details["maxGuestCapacity"] = sec_data.get("maxGuestCapacity") or details["maxGuestCapacity"]
+
+                    logger.info("[PDP DOM] Successfully extracted data (including images) from embedded JSON.")
+                    return details 
+        except Exception as e:
+            logger.warning(f"[PDP DOM] JSON parsing failed ({e}), attempting visual fallback.")
+
+        # --- STRATEGY 2: VISUAL FALLBACK (Only runs if JSON fails) ---
+        
+        if not details["location"] or details["location"] == "Where you’ll be":
+            try:
+                loc_text = page.locator('[data-section-id="LOCATION_DEFAULT"] :text-matches(",")').first.inner_text()
+                if loc_text and len(loc_text) < 100:
+                    details["location"] = loc_text
+            except: pass
+
+        if not details["title"]:
+            for sel in ['h1', '[data-testid="title"]']:
+                if page.locator(sel).count():
+                    details["title"] = page.locator(sel).first.inner_text()
+                    break
+
+        if not details["host"]:
+            host_el = page.locator('h2:has-text("Hosted by"), h2:has-text("Meet your host")').first
+            if host_el.count():
+                text = host_el.inner_text()
+                details["host"] = text.replace("Hosted by", "").replace("Meet your host", "").strip()
+
+        return details
+
+    except Exception as e:
+        logger.info(f"[PDP DOM] Details fallback completely failed: {e}")
+        return details
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
 def scrape_single_result(
     context: BrowserContext,
     item_search_token: str,
@@ -148,79 +428,43 @@ def scrape_single_result(
         "id": item_id,
         "useContextualUser": False,
         "pdpSectionsRequest": {
-            "adults": "1",
-            "categoryTag": listing_info.get("categoryTag"),
-            "children": "0",
-            "federatedSearchId": federated_search_id,
-            "infants": "0",
-            "layouts": ["SIDEBAR", "SINGLE_COLUMN"],
+            "adults": 1,
+            "children": 0,
+            "infants": 0,
             "pets": 0,
-            "photoId": listing_info.get("photoId"),
+            "layouts": ["SIDEBAR", "SINGLE_COLUMN"],
             "checkIn": listing_info.get("checkin"),
             "checkOut": listing_info.get("checkout"),
+            "categoryTag": listing_info.get("categoryTag"),
+            "photoId": listing_info.get("photoId"),
+            "federatedSearchId": federated_search_id,
             "p3ImpressionId": f"p3_{int(time.time())}_P3lbdkkYZMTFJexg",
         },
     }
     extensions = {"persistedQuery": {"version": 1, "sha256Hash": item_search_token}}
 
-    def _clean_headers(h: Dict[str, str]) -> Dict[str, str]:
-        ignore = {":authority", ":method", ":path", ":scheme", "content-length"}
-        return {k: v for k, v in (h or {}).items() if k.lower() not in ignore and not k.startswith(":")}
-
-    headers = _clean_headers(base_headers) if base_headers else {}
-    headers.update(
-        {
-            "x-airbnb-supports-airlock-v2": "true",
-            "x-airbnb-graphql-platform": "web",
-            "x-airbnb-graphql-platform-client": "minimalist-niobe",
-            "x-niobe-short-circuited": "true",
-            "x-csrf-without-token": "1",
-            "origin": "https://www.airbnb.com",
-            "referer": listing_info.get("link", "https://www.airbnb.com/"),
-            "accept-language": "en-US,en;q=0.9",
-        }
-    )
+    # Build headers
+    headers = dict(base_headers or {})
+    headers.setdefault("accept", "application/json, text/plain, */*")
+    headers.setdefault("accept-language", "en-US,en;q=0.9")
+    headers.setdefault("origin", "https://www.airbnb.com")
+    headers.setdefault("referer", listing_info.get("link", "https://www.airbnb.com/"))
+    headers.setdefault("x-airbnb-graphql-platform", "web")
+    headers.setdefault("x-airbnb-graphql-platform-client", "web")
+    headers.setdefault("content-type", "application/json")
     if api_key:
         headers["x-airbnb-api-key"] = api_key
     if client_version:
-        headers["x-client-version"] = client_version
+        headers.setdefault("x-client-version", client_version)
     if client_request_id:
-        headers["x-client-request-id"] = client_request_id
+        headers.setdefault("x-client-request-id", client_request_id)
 
-    params: Dict[str, Union[str, float, bool]] = {
-        "operationName": "StaysPdpSections",
-        "locale": locale,
-        "currency": currency,
-        "variables": json.dumps(variables),
-        "extensions": json.dumps(extensions),
-    }
-    resp = context.request.get(url=url, headers=headers, params=params, timeout=30000)
-
-    txt = resp.text()
-    if resp.status != 200:
-        logger.error(f"[PDP] HTTP {resp.status} {resp.status_text}\n{txt[:600]}")
-        return {"skip": True}
-
-    try:
-        data = resp.json()
-    except Exception:
-        logger.error("[PDP] non-JSON response")
-        return {"skip": True}
-
-    if data.get("errors"):
-        logger.error(f"[PDP] GraphQL errors: {json.dumps(data['errors'])[:800]}")
-        return {"skip": True}
-
-    root = (((data.get("data") or {}).get("presentation") or {}).get("stayProductDetailPage") or {})
-    if not root:
-        logger.info("[PDP] No data payload present; skipping.")
-        return {"skip": True}
-
-    out = {
+    # Default output structure
+    out: Dict[str, Any] = {
         "title": None,
         "roomTypeCategory": None,
-        "allPictures": [],  # This will contain ALL picture URLs in order
-        "picture": None,  # This will be the primary/first picture
+        "allPictures": [],
+        "picture": None,
         "airbnbLuxe": False,
         "location": None,
         "maxGuestCapacity": 0,
@@ -238,166 +482,197 @@ def scrape_single_result(
         "months": 0,
         "lat": None,
         "lng": None,
+        "productType": "",
+        "__typename": "",
+        "pdpType": "",
     }
-    out["productType"] = root.get("productType") or ""
-    out["__typename"] = root.get("__typename") or ""
-    out["pdpType"] = root.get("pdpType") or ""
 
-    # ENHANCED PHOTO EXTRACTION - Get ALL photos from multiple sources
-    all_photos: List[str] = []
+    # ---- 1. Try GraphQL POST ----
+    try:
+        resp = context.request.post(url=url, headers=headers, data=json.dumps({
+            "operationName": "StaysPdpSections",
+            "variables": variables,
+            "extensions": extensions,
+        }), timeout=30000)
 
-    # Method 1: Extract from root photos array (fallback)
-    initial_urls = [(p or {}).get("url") for p in (root.get("photos") or []) if p and p.get("url")]
-    if initial_urls:
-        all_photos.extend(initial_urls)
-        logger.info(f"Found {len(initial_urls)} photos from root.photos")
+        if resp.status == 200:
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            
+            if data and not data.get("errors"):
+                root = (((data.get("data") or {}).get("presentation") or {}).get("stayProductDetailPage") or {})
+                if root:
+                    out["productType"] = root.get("productType") or ""
+                    out["__typename"] = root.get("__typename") or ""
+                    out["pdpType"] = root.get("pdpType") or ""
 
+                    # Photos from root
+                    all_photos: List[str] = []
+                    initial_urls = [(p or {}).get("url") for p in (root.get("photos") or []) if p and p.get("url")]
+                    if initial_urls:
+                        all_photos.extend(initial_urls)
+                        logger.info(f"Found {len(initial_urls)} photos from root.photos")
 
-    # --- Luxe detection (strict, no banner fallback) ---
-    ptype = (root.get("productType") or "").upper()
-    tname = (root.get("__typename") or "").upper()
-    pdp   = (root.get("pdpType") or "").upper()
+                    # Luxe detection
+                    ptype = (root.get("productType") or "").upper()
+                    tname = (root.get("__typename") or "").upper()
+                    pdp = (root.get("pdpType") or "").upper()
+                    out["airbnbLuxe"] = bool(ptype == "LUXE" or pdp == "LUXE" or ("LUXE" in tname))
 
-    out["airbnbLuxe"] = bool(
-        ptype == "LUXE" or pdp == "LUXE" or ("LUXE" in tname)
-    )
+                    # Sections
+                    section_list = ((root.get("sections") or {}).get("sections")) or []
+                    for sec in section_list:
+                        if not isinstance(sec, dict):
+                            continue
+                        try:
+                            sid = (sec.get("sectionId") or "")
+                            payload = sec.get("section") or {}
 
+                            if sid and ("PHOTOGALLERY" in sid or "PHOTO" in sid):
+                                try:
+                                    photo_sources = [
+                                        payload.get("mediaItems", []),
+                                        payload.get("photos", []),
+                                        payload.get("images", []),
+                                        payload.get("galleryItems", []),
+                                    ]
+                                    for source in photo_sources:
+                                        if not source: continue
+                                        for item in source:
+                                            if not item or not isinstance(item, dict): continue
+                                            photo_url = None
+                                            url_fields = ["baseUrl", "url", "originalUrl", "largeUrl", "pictureUrl"]
+                                            for field in url_fields:
+                                                if item.get(field):
+                                                    photo_url = item[field]
+                                                    break
+                                            if not photo_url:
+                                                picture_obj = item.get("picture", {})
+                                                if isinstance(picture_obj, dict):
+                                                    for field in url_fields:
+                                                        if picture_obj.get(field):
+                                                            photo_url = picture_obj[field]
+                                                            break
+                                            if photo_url:
+                                                all_photos.append(photo_url)
+                                except Exception as e:
+                                    logger.warning(f"Could not parse photo gallery section {sid}: {e}")
 
-    section_list = ((root.get("sections") or {}).get("sections")) or []
-    for sec in section_list:
-        if not isinstance(sec, dict):
-            continue
+                            elif sid == "TITLE_DEFAULT":
+                                out["title"] = payload.get("title")
+                                out["roomTypeCategory"] = payload.get("roomTypeCategory")
+                                try:
+                                    pic_url = payload.get("shareSave", {}).get("embedData", {}).get("pictureUrl")
+                                    if pic_url: all_photos.insert(0, pic_url)
+                                except: pass
 
-        try:
-            sid = (sec.get("sectionId") or "")
-            payload = sec.get("section") or {}
+                            elif sid == "AVAILABILITY_CALENDAR_DEFAULT":
+                                out["location"] = payload.get("localizedLocation")
+                                out["maxGuestCapacity"] = payload.get("maxGuestCapacity", 0)
 
-            # Method 2: COMPREHENSIVE PHOTO GALLERY EXTRACTION
-            if sid and ("PHOTOGALLERY" in sid or "PHOTO" in sid):
-                try:
-                    photo_sources = [
-                        payload.get("mediaItems", []),
-                        payload.get("photos", []),
-                        payload.get("images", []),
-                        payload.get("galleryItems", []),
-                    ]
+                            elif sid == "REVIEWS_DEFAULT":
+                                out["isGuestFavorite"] = bool(payload.get("isGuestFavorite"))
+                                out["reviewsCount"] = payload.get("overallCount", 0)
+                                out["averageRating"] = payload.get("overallRating", 0.0)
 
-                    for source in photo_sources:
-                        if not source:
+                            elif sid == "LOCATION_DEFAULT":
+                                out["lat"] = payload.get("lat")
+                                out["lng"] = payload.get("lng")
+
+                            elif sid == "MEET_YOUR_HOST":
+                                card = payload.get("cardData") or {}
+                                out["host"] = card.get("name")
+                                out["isSuperhost"] = bool(card.get("isSuperhost"))
+                                out["isVerified"] = bool(card.get("isVerified"))
+                                out["ratingCount"] = card.get("ratingCount", 0)
+
+                                for key in ("about", "description", "bio", "hostBio", "hostDescription"):
+                                    val = card.get(key)
+                                    if isinstance(val, str) and len(val.strip()) >= 40:
+                                        out["hostAboutText"] = val.strip()
+                                        break
+
+                                user_id_b64 = card.get("userId")
+                                if user_id_b64:
+                                    try:
+                                        out["userId"] = base64.b64decode(user_id_b64.encode("utf-8")).decode("utf-8").split(":")[-1]
+                                    except:
+                                        out["userId"] = str(user_id_b64)
+                                if out["userId"]:
+                                    out["userUrl"] = f"https://www.airbnb.com/users/show/{out['userId']}"
+
+                                time_as_host = card.get("timeAsHost") or {}
+                                out["years"] = time_as_host.get("years", 0)
+                                out["months"] = time_as_host.get("months", 0)
+                                out["hostrAtingAverage"] = card.get("ratingAverage", 0.0)
+                        except Exception:
                             continue
 
-                        for item in source:
-                            if not item or not isinstance(item, dict):
-                                continue
+                    # Success! Process photos and return
+                    unique_photos = list(dict.fromkeys([u for u in all_photos if u]))
+                    out["allPictures"] = unique_photos
+                    if unique_photos:
+                        out["picture"] = unique_photos[0]
 
-                            # Try different URL fields
-                            photo_url = None
-                            url_fields = ["baseUrl", "url", "originalUrl", "largeUrl", "pictureUrl"]
+                    logger.info(f"Final photo count for {_id}: {len(unique_photos)} unique photos")
+                    return out
+            else:
+                logger.error(f"[PDP] GraphQL errors")
+        else:
+            logger.error(f"[PDP] HTTP {resp.status}")
 
-                            for field in url_fields:
-                                if item.get(field):
-                                    photo_url = item[field]
-                                    break
+    except Exception as e:
+        logger.error(f"[PDP] Request failed: {e}")
 
-                            # Also check nested structures
-                            if not photo_url:
-                                picture_obj = item.get("picture", {})
-                                if isinstance(picture_obj, dict):
-                                    for field in url_fields:
-                                        if picture_obj.get(field):
-                                            photo_url = picture_obj[field]
-                                            break
+    # ---- 2. Fallback: Scrape details + images from DOM ----
+    logger.info(f"[PDP] Falling back to DOM scraping for {_id}")
+    dom_details = _scrape_details_from_dom(context, listing_info.get("link", ""), logger)
+    
+    if dom_details:
+        # Merge details
+        for k, v in dom_details.items():
+            if v not in (None, "", []):
+                out[k] = v
+        
+        # Merge images extracted from JSON
+        if dom_details.get("allPictures"):
+            out["allPictures"].extend(dom_details["allPictures"])
+            out["allPictures"] = list(dict.fromkeys(out["allPictures"])) # Dedup immediately
 
-                            if photo_url and photo_url not in all_photos:
-                                all_photos.append(photo_url)
+    # ---- 3. Last Resort: Visual Scrolling ----
+    # ONLY run if we found NO images in the JSON to save time
+    if not out["allPictures"]:
+        logger.info("[PDP DOM] No images found in JSON, running slow visual scraper...")
+        photos = _scrape_images_from_dom(context, listing_info.get("link", ""), logger)
+        if photos:
+            out["allPictures"].extend(photos)
 
-                    if all_photos:
-                        logger.info(f"Found {len(all_photos)} total photos from gallery section {sid}")
+    # ---- 4. Final Cleanup & Dedup ----
+    clean_photos = []
+    seen_urls = set()
+    combined = out.get("allPictures") or []
+    
+    for p in combined:
+        if not p: continue
+        p_clean = p.split("?")[0] 
+        lower_p = p_clean.lower()
+        
+        # Filter junk
+        if "/pictures/user/" in lower_p: continue
+        if "airbnb-platform-assets" in lower_p: continue
+        if "static/packages" in lower_p: continue
+        
+        if p_clean not in seen_urls:
+            clean_photos.append(p_clean)
+            seen_urls.add(p_clean)
 
-                except Exception as e:
-                    logger.warning(f"Could not parse photo gallery section {sid} for {_id}: {e}")
+    out["allPictures"] = clean_photos
+    if clean_photos:
+        out["picture"] = clean_photos[0]
 
-            elif sid == "TITLE_DEFAULT":
-                out["title"] = payload.get("title")
-                out["roomTypeCategory"] = payload.get("roomTypeCategory")
-                try:
-                    # Get primary picture but don't overwrite our comprehensive list
-                    pic_url = payload.get("shareSave", {}).get("embedData", {}).get("pictureUrl")
-                    if pic_url and pic_url not in all_photos:
-                        # Insert at beginning as it's likely the main photo
-                        all_photos.insert(0, pic_url)
-                except (KeyError, TypeError):
-                    pass
-
-            elif sid == "AVAILABILITY_CALENDAR_DEFAULT":
-                out["location"] = payload.get("localizedLocation")
-                out["maxGuestCapacity"] = payload.get("maxGuestCapacity", 0)
-
-            elif sid == "REVIEWS_DEFAULT":
-                out["isGuestFavorite"] = bool(payload.get("isGuestFavorite"))
-                out["reviewsCount"] = payload.get("overallCount", 0)
-                out["averageRating"] = payload.get("overallRating", 0.0)
-
-            elif sid == "LOCATION_DEFAULT":
-                out["lat"] = payload.get("lat")
-                out["lng"] = payload.get("lng")
-
-            elif sid == "MEET_YOUR_HOST":
-                card = payload.get("cardData") or {}
-                out["host"] = card.get("name")
-                out["isSuperhost"] = bool(card.get("isSuperhost"))
-                out["isVerified"] = bool(card.get("isVerified"))
-                out["ratingCount"] = card.get("ratingCount", 0)
-
-                # Try to capture a longer host description if present
-                for key in ("about", "description", "bio", "hostBio", "hostDescription"):
-                    val = card.get(key)
-                    if isinstance(val, str) and len(val.strip()) >= 40:
-                        out["hostAboutText"] = val.strip()
-                        break
-
-                user_id_b64 = card.get("userId")
-                if user_id_b64:
-                    try:
-                        out["userId"] = base64.b64decode(user_id_b64.encode("utf-8")).decode("utf-8").split(":")[-1]
-                    except Exception:
-                        out["userId"] = str(user_id_b64)
-
-                if out["userId"]:
-                    out["userUrl"] = f"https://www.airbnb.com/users/show/{out['userId']}"
-
-                time_as_host = card.get("timeAsHost") or {}
-                out["years"] = time_as_host.get("years", 0)
-                out["months"] = time_as_host.get("months", 0)
-                out["hostrAtingAverage"] = card.get("ratingAverage", 0.0)
-
-
-                # co-hosts present but not used downstream; kept for completeness
-                for ch in (card.get("coHosts") or []):
-                    ch_id_raw = ch.get("userId") or ch.get("id")
-                    ch_id = None
-                    if isinstance(ch_id_raw, str):
-                        try:
-                            ch_id = base64.b64decode(ch_id_raw.encode("utf-8")).decode("utf-8").split(":")[-1]
-                        except Exception:
-                            ch_id = ch_id_raw
-                    elif isinstance(ch_id_raw, int):
-                        ch_id = str(ch_id_raw)
-                    # (no storage here)
-
-        except Exception as e:
-            logger.warning(f"Error processing section {sid}: {e}")
-            continue
-
-    # Final photo processing - remove duplicates while preserving order
-    unique_photos = list(dict.fromkeys([url for url in all_photos if url]))
-    out["allPictures"] = unique_photos
-
-    # Set primary picture
-    if unique_photos:
-        out["picture"] = unique_photos[0]
-
-    logger.info(f"Final photo count for {_id}: {len(unique_photos)} unique photos")
-
+    logger.info(f"Fallback photo count for {_id}: {len(clean_photos)}")
     return out
 
+    

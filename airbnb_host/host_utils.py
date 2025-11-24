@@ -33,12 +33,52 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
         "totalListings": None,
         "guidebooks": [],
         "travels": [],
-        "hostReviews": []
+        "hostReviews": [],
+        "years": None, 
+        "months": None
     }
     
     try:
         # Wait for content to load
         page.wait_for_timeout(3000)
+
+
+        try:
+            # 1. Reviews Count
+            # HTML: <span data-testid="Reviews-stat-heading">84</span>
+            rev_el = page.locator('[data-testid="Reviews-stat-heading"]').first
+            if rev_el.count():
+                txt = rev_el.inner_text().strip()
+                if txt.isdigit():
+                    profile["ratingCount"] = int(txt)
+
+            # 2. Rating Average
+            # HTML: <span data-testid="Rating-stat-heading">4.92...</span>
+            rate_el = page.locator('[data-testid="Rating-stat-heading"]').first
+            if rate_el.count():
+                # Extract just the number "4.92" ignoring any SVG icons
+                m = re.search(r"(\d+(?:\.\d+)?)", rate_el.inner_text())
+                if m:
+                    profile["ratingAverage"] = float(m.group(1))
+
+            # 3. Years/Months Hosting
+            # HTML: <span data-testid="Months hosting-stat-heading">6</span>
+            for unit in ["Years", "Months"]:
+                time_el = page.locator(f'[data-testid="{unit} hosting-stat-heading"]').first
+                if time_el.count():
+                    txt = time_el.inner_text().strip()
+                    if txt.isdigit():
+                        profile[unit.lower()] = int(txt)
+            
+            if profile["ratingAverage"]:
+                logger.info(f"✅ Specific Stats Found: {profile['ratingAverage']} ({profile['ratingCount']})")
+        except Exception:
+            pass
+
+
+
+
+
         
         # Extract host name - More specific selectors
         name_selectors = [
@@ -265,7 +305,26 @@ def extract_profile_from_dom(page: Page, logger: logging.Logger) -> Dict[str, An
                 logger.info("✅ Host is verified")
         except Exception:
             pass
-        
+        try:
+            # Reviews
+            rev_el = page.locator('[data-testid="Reviews-stat-heading"]').first
+            if rev_el.count() and rev_el.inner_text().strip().isdigit():
+                profile["ratingCount"] = int(rev_el.inner_text().strip())
+
+            # Rating
+            rate_el = page.locator('[data-testid="Rating-stat-heading"]').first
+            if rate_el.count():
+                m = re.search(r"(\d+(?:\.\d+)?)", rate_el.inner_text())
+                if m:
+                    profile["ratingAverage"] = float(m.group(1))
+
+            # Years/Months
+            for unit in ["Years", "Months"]:
+                time_el = page.locator(f'[data-testid="{unit} hosting-stat-heading"]').first
+                if time_el.count() and time_el.inner_text().strip().isdigit():
+                    profile[unit.lower()] = int(time_el.inner_text().strip())
+        except Exception:
+            pass
         # Extract ratings - Look for star ratings
         try:
             rating_selectors = [

@@ -1,4 +1,5 @@
 import re
+import os
 import time
 import json
 import urllib.parse
@@ -1361,7 +1362,9 @@ def scrape_host(host_url: str):
     request_headers: Dict[str, str] = {}
     request_item_token: Optional[str] = None
     request_item_client_id: Optional[str] = None
-    x_airbnb_api_key = 
+    x_airbnb_api_key = os.getenv("AIRBNB_API_KEY")
+    x_airbnb_api_key_captured: Optional[str] = None            # your name
+
     request_client_version: Optional[str] = None
 
     with sync_playwright() as p:
@@ -1385,7 +1388,7 @@ def scrape_host(host_url: str):
         context = Tarnished.apply_stealth(context)
 
         def handle_request(route: Route):
-            nonlocal request_item_token, request_item_client_id, request_headers, x_airbnb_api_key, request_client_version
+            nonlocal request_item_token, request_item_client_id, request_headers, x_airbnb_api_key_captured, request_client_version
             req = route.request
             if "/api/v3/StaysPdpSections" in req.url:
                 token = _extract_pdp_token_from_request(req)
@@ -1395,14 +1398,14 @@ def scrape_host(host_url: str):
                 request_headers = req.headers.copy()
                 api_k = req.headers.get("x-airbnb-api-key")
                 if api_k:
-                    x_airbnb_api_key = api_k
+                    x_airbnb_api_key_captured = api_k.strip()
                 request_client_version = req.headers.get("x-client-version") or request_client_version
             route.continue_()
 
         context.route("**/api/v3/*", handle_request)
 
         def on_request(req: Request):
-            nonlocal request_item_token, request_item_client_id, request_headers, x_airbnb_api_key, request_client_version
+            nonlocal request_item_token, request_item_client_id, request_headers, x_airbnb_api_key_captured, request_client_version
             if "/api/v3/StaysPdpSections" in req.url:
                 token = _extract_pdp_token_from_request(req)
                 if token and not request_item_token:
@@ -1411,7 +1414,7 @@ def scrape_host(host_url: str):
                 request_headers = req.headers.copy()
                 api_k = req.headers.get("x-airbnb-api-key")
                 if api_k:
-                    x_airbnb_api_key = api_k
+                    x_airbnb_api_key_captured = api_k.strip()
                 request_client_version = req.headers.get("x-client-version") or request_client_version
 
         context.on("request", on_request)
@@ -1505,14 +1508,20 @@ def scrape_host(host_url: str):
             SQL.upsert_host_reviews(db, user_id, reviews)
             SQL.backfill_host_child_names(db, user_id)
 
+        # 1. CALL THE UTILS FUNCTION TO GET THE DATA
+        dom_stats = Utils.extract_profile_from_dom(page, logger)
+
         base_profile = {
             "userId": user_id,
             "userUrl": host_url,
             "name": host_name,
             "isSuperhost": is_super,
             "isVerified": is_ver,
-            "ratingAverage": None,
-            "ratingCount": None,
+            "ratingAverage": dom_stats.get("ratingAverage"),
+            "ratingCount": dom_stats.get("ratingCount"),
+            "years": dom_stats.get("years"),
+            "months": dom_stats.get("months"),
+            "total_listings": None,
             "profile_url": host_url,
             "scraping_time": int(time.time()),
             "profile_photo_url": profile_photo_url,
@@ -1570,18 +1579,68 @@ def scrape_host(host_url: str):
                         "checkin": checkin_date,
                         "checkout": checkout_date,
                     }
+
+                    # ---- Build session-authenticated headers ----
+                    base_h = (request_headers or {}).copy()
+                    base_h.pop("content-length", None)
+
+                    # Mirror the live browser UA
+                    try:
+                        ua = page.evaluate("() => navigator.userAgent") or None
+                        if ua:
+                            base_h["user-agent"] = ua
+                    except Exception:
+                        pass
+
+                    # Add browser cookies for session binding
+                    try:
+                        cookies = context.cookies()
+                        cookie_header = "; ".join(
+                            f"{c['name']}={c['value']}" for c in cookies if "airbnb.com" in (c.get("domain") or "")
+                        )
+                        if cookie_header:
+                            base_h["cookie"] = cookie_header
+                    except Exception:
+                        cookies = []
+
+                    # Inject CSRF if present
+                    try:
+                        csrf = next(
+                            (c["value"] for c in cookies if c.get("name") in ("csrf_token", "airbed_csrf_token")),
+                            None,
+                        )
+                        if csrf and "x-csrf-token" not in {k.lower(): v for k, v in base_h.items()}:
+                            base_h["x-csrf-token"] = csrf
+                    except Exception:
+                        pass
+
+                    # GraphQL context headers
+                    base_h.setdefault("x-airbnb-graphql-platform", "web")
+                    base_h.setdefault("x-airbnb-graphql-platform-client", "web")
+                    base_h.setdefault("origin", "https://www.airbnb.com")
+                    base_h.setdefault("referer", item["listingUrl"])
+
+                    # Captured key and client info
+                    if x_airbnb_api_key_captured:
+                        base_h["x-airbnb-api-key"] = x_airbnb_api_key_captured
+                    if request_client_version:
+                        base_h["x-client-version"] = request_client_version
+                    if request_item_client_id:
+                        base_h["x-client-request-id"] = request_item_client_id
+
+                    # ---- Call the scraper with merged headers ----
                     dd = HostScrapingUtils.scrape_single_result(
                         context=context,
                         item_search_token=request_item_token,
                         listing_info=info,
                         logger=logger,
-                        api_key=x_airbnb_api_key,
+                        api_key=x_airbnb_api_key_captured,
                         client_version=request_client_version or "",
                         client_request_id=request_item_client_id or "",
                         federated_search_id="",
                         currency="MAD",
                         locale="en",
-                        base_headers=request_headers,
+                        base_headers=base_h,  # use the real browser headers
                     )
 
                     if not dd.get("skip", False):
@@ -1597,7 +1656,7 @@ def scrape_host(host_url: str):
                         dd["link"] = item["listingUrl"]
                         # Ensure dd carries userUrl so it can be saved into listing_tracking
                         if not dd.get("userUrl") and dd.get("userId"):
-                            dd["userUrl"] = f"https://www.airbnb.com/users/show/{dd['userId']}"
+                            dd["userUrl"] = f"https://www.airbnb.com/users/profile/{dd['userId']}"
 
                         SQL.insert_new_listing(db, dd)
 
@@ -1653,6 +1712,8 @@ def scrape_host(host_url: str):
                     logger.info(f"[host] ❌ PDP hydrate failed for {_id}: {e}")
 
             else:
+
+                print("ksfljhmsqùmjqogjodsjgojgodjojodjdojgodjgdogjdojgodd")
                 # Only insert basic listing if PDP not scraped
                 if not SQL.check_if_listing_exists(db, _id):
                     try:

@@ -109,10 +109,11 @@ CREATE TABLE IF NOT EXISTS host_listings (
   listingId TEXT,
   listingUrl TEXT,
   PRIMARY KEY (userId, listingId),
-  FOREIGN KEY (userId)    REFERENCES host_tracking(userId)     ON DELETE CASCADE,
+  FOREIGN KEY (userId)    REFERENCES host_tracking(userId)       ON DELETE CASCADE,
   FOREIGN KEY (listingId) REFERENCES listing_tracking(ListingId) ON DELETE CASCADE
 );
 """
+
 # ---- child: guidebooks -----------------------------------------
 
 """

@@ -356,7 +356,7 @@ def start_scraping(logger: logging.Logger, db: sqlite3.Connection):
     request_monthly_end_date = []
     request_monthly_start_date = []
     request_place_id = []
-    x_airbnb_api_key =  
+    x_airbnb_api_key = "d306zoyjsyarp7ifhu67rjxn52tv0t20" 
 
     # PDP detail capture vars
     request_item_token = None
