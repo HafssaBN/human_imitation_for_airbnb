@@ -47,7 +47,6 @@ If this is your first time using Playwright, install the browser:
 
 ```bash
 playwright install
-playwright install chromium
 ```
 
 ---
